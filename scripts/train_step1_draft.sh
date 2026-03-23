@@ -46,6 +46,12 @@ LR=2e-5
 WARMUP_RATIO=0.03
 L2L_LOSS_SCALE=10.0
 
+# Training-time test (EAGLE-style multi-step rollout)
+# Set to "true" to train with multi-step prediction
+TRAIN_TIME_TEST="false"
+TTT_STEPS=7          # Number of rollout steps
+TTT_DECAY=0.8        # Exponential decay for each step's loss weight
+
 # DeepSpeed
 NUM_GPUS=4
 DS_CONFIG="configs/zero3.json"
@@ -65,6 +71,7 @@ echo "  Dataset: ${DATASET}"
 echo "  Eff Bit: ${EFF_BIT}"
 echo "  GPUs: ${NUM_GPUS}"
 echo "  Output: ${SAVE_DIR}"
+echo "  Train-time test: ${TRAIN_TIME_TEST} (steps=${TTT_STEPS}, decay=${TTT_DECAY})"
 echo "============================================================"
 
 SHAREGPT_ARG=""
@@ -92,7 +99,10 @@ deepspeed --num_gpus=${NUM_GPUS} train_step1_draft.py \
     --l2l_loss_scale ${L2L_LOSS_SCALE} \
     --ds_config_path ${DS_CONFIG} \
     --run_name ${RUN_NAME} \
-    --report ${REPORT}
+    --report ${REPORT} \
+    --train_time_test ${TRAIN_TIME_TEST} \
+    --ttt_steps ${TTT_STEPS} \
+    --ttt_decay ${TTT_DECAY}
 
 echo "============================================================"
 echo "Step 1 Complete!"

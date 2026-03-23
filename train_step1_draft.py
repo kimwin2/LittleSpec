@@ -32,7 +32,7 @@ from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
 from quantization.utils import apply_littlebit_patch
 from utils.datautils import prepare_dataset, load_tokenizer
-from utils.kd_utils import KDTrainer
+from utils.kd_utils import KDTrainer, TrainTimeTestKDTrainer
 from utils.misc import setup_logger
 from utils.utils import prepare_model_for_training, print_trainable_parameters
 
@@ -99,6 +99,14 @@ def get_args():
     parser.add_argument("--eff_bit", type=float, default=0.1)
     parser.add_argument("--kv_factor", type=float, default=1.0)
     parser.add_argument("--min_split_dim", type=int, default=8)
+
+    # Training-time test (EAGLE-style multi-step rollout)
+    parser.add_argument("--train_time_test", type=str2bool, default=False,
+                        help="Enable training-time test (multi-step rollout)")
+    parser.add_argument("--ttt_steps", type=int, default=7,
+                        help="Number of rollout steps for training-time test")
+    parser.add_argument("--ttt_decay", type=float, default=0.8,
+                        help="Exponential decay factor for rollout loss weighting")
 
     args = parser.parse_args()
     return args
@@ -182,15 +190,30 @@ def load_teacher_model(args, num_gpus, torch_dtype, config_path="configs/zero3_i
 
 
 def setup_trainer(model, teacher_model, tokenizer, datasets, training_args, args):
-    trainer = KDTrainer(
-        model=model,
-        teacher_model=teacher_model,
-        l2l_loss_scale=args.l2l_loss_scale,
-        processing_class=tokenizer,
-        train_dataset=datasets,
-        args=training_args,
-        data_collator=default_data_collator,
-    )
+    if args.train_time_test:
+        logger.info(f"Using TrainTimeTestKDTrainer (steps={args.ttt_steps}, decay={args.ttt_decay})")
+        trainer = TrainTimeTestKDTrainer(
+            model=model,
+            teacher_model=teacher_model,
+            l2l_loss_scale=args.l2l_loss_scale,
+            train_time_test_steps=args.ttt_steps,
+            train_time_test_decay=args.ttt_decay,
+            processing_class=tokenizer,
+            train_dataset=datasets,
+            args=training_args,
+            data_collator=default_data_collator,
+        )
+    else:
+        logger.info("Using standard KDTrainer (single-step KD)")
+        trainer = KDTrainer(
+            model=model,
+            teacher_model=teacher_model,
+            l2l_loss_scale=args.l2l_loss_scale,
+            processing_class=tokenizer,
+            train_dataset=datasets,
+            args=training_args,
+            data_collator=default_data_collator,
+        )
     return trainer
 
 
