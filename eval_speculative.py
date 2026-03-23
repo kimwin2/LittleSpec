@@ -37,8 +37,9 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM
 
 from speculative_decoding import (
-    MatryoshkaDraftModel, MatryoshkaTargetModel,
+    MatryoshkaDraftModel, MatryoshkaTargetModel, FPTargetModel,
     speculative_decode, autoregressive_generate, str2bool,
+    load_target_model,
 )
 from utils.datautils import load_tokenizer
 from utils.misc import setup_logger
@@ -173,7 +174,7 @@ BENCHMARK_LOADERS = {
 
 def evaluate_benchmark(
     draft_model: MatryoshkaDraftModel,
-    target_model: MatryoshkaTargetModel,
+    target_model,  # FPTargetModel or MatryoshkaTargetModel
     tokenizer,
     prompts: List[str],
     benchmark_name: str,
@@ -373,11 +374,15 @@ def save_results(all_results: List[Dict], output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Matryoshka Speculative Decoding")
-    parser.add_argument("--base_model_id", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--base_model_id", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
+                        help="Base model ID (for tokenizer, and FP target if target_mode=fp)")
     parser.add_argument("--draft_model_path", type=str, required=True,
                         help="Path to 0.1-bit draft model")
-    parser.add_argument("--residual_model_path", type=str, required=True,
-                        help="Path to 0.9-bit residual model")
+    parser.add_argument("--residual_model_path", type=str, default=None,
+                        help="Path to 0.9-bit residual model (required for target_mode=matryoshka)")
+    parser.add_argument("--target_mode", type=str, default="fp",
+                        choices=["fp", "matryoshka"],
+                        help="Target model type: 'fp'=original FP model, 'matryoshka'=0.1+0.9 combined")
     parser.add_argument("--benchmark", type=str, default="all",
                         choices=["all", "mt_bench", "gsm8k", "humaneval", "summarization"],
                         help="Which benchmark to run")
@@ -396,6 +401,8 @@ def main():
     greedy = args.mode == "greedy"
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     
+    target_desc = "FP (original)" if args.target_mode == "fp" else "Matryoshka (0.1+0.9 bit)"
+    
     # Load tokenizer
     logger.info("Loading tokenizer...")
     tokenizer = load_tokenizer(args.base_model_id)
@@ -407,11 +414,8 @@ def main():
         args.draft_model_path, torch_dtype=torch.bfloat16, device=str(device)
     )
     
-    logger.info("Loading target model (0.1-bit + 0.9-bit)...")
-    target_model = MatryoshkaTargetModel(
-        args.draft_model_path, args.residual_model_path,
-        torch_dtype=torch.bfloat16, device=str(device)
-    )
+    logger.info(f"Loading target model ({target_desc})...")
+    target_model = load_target_model(args, device)
     
     # Determine benchmarks to run
     if args.benchmark == "all":

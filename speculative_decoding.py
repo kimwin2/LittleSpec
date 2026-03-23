@@ -1,20 +1,24 @@
 """
 Speculative Decoding with Matryoshka LittleBit Models
 
-Uses a 0.1-bit draft model for fast token generation and a combined
-(0.1-bit + 0.9-bit) target model for verification.
+Supports two target modes:
+1. "fp" mode: Draft=0.1-bit, Target=original FP model (for pre-Step2 benchmarking)
+2. "matryoshka" mode: Draft=0.1-bit, Target=0.1-bit+0.9-bit combined (post-Step2)
 
-Supports both greedy and sampling modes with configurable draft length.
+Usage (FP target - before Step 2):
+    python speculative_decoding.py \
+        --base_model_id meta-llama/Llama-3.1-8B-Instruct \
+        --draft_model_path outputs/step1_draft_0.1bit/<timestamp> \
+        --target_mode fp \
+        --max_new_tokens 256 --draft_length 5
 
-Usage:
+Usage (Matryoshka target - after Step 2):
     python speculative_decoding.py \
         --base_model_id meta-llama/Llama-3.1-8B-Instruct \
         --draft_model_path outputs/step1_draft_0.1bit/<timestamp> \
         --residual_model_path outputs/step2_residual_0.9bit/<timestamp> \
-        --prompt "Write a Python function to sort a list" \
-        --max_new_tokens 256 \
-        --draft_length 5 \
-        --mode greedy
+        --target_mode matryoshka \
+        --max_new_tokens 256 --draft_length 5
 """
 
 import argparse
@@ -124,6 +128,35 @@ class MatryoshkaDraftModel:
         return draft_tokens, draft_probs
 
 
+class FPTargetModel:
+    """Original FP (full-precision) model as target for speculative decoding.
+    
+    Use this when benchmarking before Step 2 (residual training).
+    Draft = 0.1-bit quantized model, Target = original FP model.
+    """
+    
+    def __init__(self, model_id, torch_dtype=torch.bfloat16, device="cuda"):
+        logger.info(f"Loading FP target model from {model_id}...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            device_map=device,
+            trust_remote_code=True,
+        )
+        self.model.eval()
+        self.device = next(self.model.parameters()).device
+        logger.info(f"FP target model loaded on {self.device}")
+    
+    @torch.no_grad()
+    def forward(self, input_ids, attention_mask=None):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        return outputs.logits
+
+
 class MatryoshkaTargetModel:
     """Combined 0.1-bit + 0.9-bit target model for verification."""
     
@@ -200,7 +233,7 @@ class MatryoshkaTargetModel:
 
 def speculative_decode(
     draft_model: MatryoshkaDraftModel,
-    target_model: MatryoshkaTargetModel,
+    target_model,  # FPTargetModel or MatryoshkaTargetModel
     input_ids: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
     max_new_tokens: int = 256,
@@ -215,7 +248,7 @@ def speculative_decode(
     
     Args:
         draft_model: Fast 0.1-bit model for draft generation
-        target_model: Combined (0.1 + 0.9)-bit model for verification
+        target_model: Target model for verification (FP or Matryoshka)
         input_ids: Input token IDs (batch=1)
         attention_mask: Attention mask
         max_new_tokens: Maximum new tokens to generate
@@ -269,35 +302,27 @@ def speculative_decode(
         target_logits = target_model.forward(verify_ids, verify_mask)  # (1, seq_len + K, vocab)
         
         # The target logits at position i correspond to predicting token i+1
-        # We need target logits at positions [seq_len-1, seq_len, ..., seq_len+K-1]
-        # which predict tokens at [seq_len, seq_len+1, ..., seq_len+K]
         seq_len = current_ids.shape[1]
         
         # === Accept/Reject Phase ===
         accepted_count = 0
         for i in range(k):
-            target_logit_i = target_logits[:, seq_len - 1 + i, :]  # target prediction for position seq_len+i
-            draft_token_i = draft_tokens[i]  # (1, 1)
+            target_logit_i = target_logits[:, seq_len - 1 + i, :]
+            draft_token_i = draft_tokens[i]
             
             if greedy:
-                # Greedy: accept if target argmax matches draft token
                 target_token = torch.argmax(target_logit_i, dim=-1, keepdim=True)
                 if target_token.item() == draft_token_i.item():
                     accepted_count += 1
                     generated_tokens.append(draft_token_i.item())
-                    
-                    # Check EOS
                     if draft_token_i.item() == eos_token_id:
                         break
                 else:
-                    # Reject: use target token instead
                     generated_tokens.append(target_token.item())
                     if target_token.item() == eos_token_id:
                         break
                     break
             else:
-                # Sampling: rejection sampling
-                # Accept with probability min(1, p_target / p_draft)
                 target_prob_i = F.softmax(target_logit_i / max(temperature, 1e-8), dim=-1)
                 draft_prob_i = draft_probs[i]
                 
@@ -313,7 +338,6 @@ def speculative_decode(
                     if token_idx == eos_token_id:
                         break
                 else:
-                    # Reject: resample from max(0, p_target - p_draft)
                     residual_prob = torch.clamp(target_prob_i - draft_prob_i, min=0)
                     residual_prob = residual_prob / (residual_prob.sum() + 1e-10)
                     corrected_token = torch.multinomial(residual_prob, num_samples=1)
@@ -340,9 +364,6 @@ def speculative_decode(
                        f"total generated {len(generated_tokens)}")
         
         # Update current sequence
-        new_tokens = torch.tensor([generated_tokens[-(accepted_count + (1 if accepted_count == k else 1)):]], 
-                                   device=device, dtype=torch.long).unsqueeze(0)
-        # Simple approach: just rebuild current_ids from scratch
         all_gen = torch.tensor([generated_tokens], device=device, dtype=torch.long)
         current_ids = torch.cat([input_ids, all_gen], dim=1)
         if attention_mask is not None:
@@ -372,7 +393,7 @@ def speculative_decode(
 
 
 def autoregressive_generate(
-    target_model: MatryoshkaTargetModel,
+    target_model,  # FPTargetModel or MatryoshkaTargetModel
     input_ids: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
     max_new_tokens: int = 256,
@@ -424,14 +445,36 @@ def autoregressive_generate(
     return output_ids, stats
 
 
+def load_target_model(args, device):
+    """Load target model based on target_mode."""
+    if args.target_mode == "fp":
+        logger.info("Loading FP (full-precision) target model...")
+        return FPTargetModel(
+            args.base_model_id, torch_dtype=torch.bfloat16, device=str(device)
+        )
+    elif args.target_mode == "matryoshka":
+        if not args.residual_model_path:
+            raise ValueError("--residual_model_path required for matryoshka target mode")
+        logger.info("Loading Matryoshka target model (0.1-bit + 0.9-bit)...")
+        return MatryoshkaTargetModel(
+            args.draft_model_path, args.residual_model_path,
+            torch_dtype=torch.bfloat16, device=str(device)
+        )
+    else:
+        raise ValueError(f"Unknown target_mode: {args.target_mode}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Speculative Decoding with Matryoshka LittleBit")
     parser.add_argument("--base_model_id", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
-                        help="Base model ID for tokenizer")
+                        help="Base model ID (for tokenizer, and FP target if target_mode=fp)")
     parser.add_argument("--draft_model_path", type=str, required=True,
                         help="Path to 0.1-bit draft model")
-    parser.add_argument("--residual_model_path", type=str, required=True,
-                        help="Path to 0.9-bit residual model")
+    parser.add_argument("--residual_model_path", type=str, default=None,
+                        help="Path to 0.9-bit residual model (required for target_mode=matryoshka)")
+    parser.add_argument("--target_mode", type=str, default="fp",
+                        choices=["fp", "matryoshka"],
+                        help="Target model type: 'fp'=original FP model, 'matryoshka'=0.1+0.9 combined")
     parser.add_argument("--prompt", type=str, 
                         default="Write a Python function to compute fibonacci numbers efficiently.",
                         help="Input prompt for generation")
@@ -460,11 +503,9 @@ def main():
         args.draft_model_path, torch_dtype=torch.bfloat16, device=str(device)
     )
     
-    logger.info("Loading target model (0.1-bit + 0.9-bit)...")
-    target_model = MatryoshkaTargetModel(
-        args.draft_model_path, args.residual_model_path,
-        torch_dtype=torch.bfloat16, device=str(device)
-    )
+    target_model = load_target_model(args, device)
+    
+    target_desc = "FP (original)" if args.target_mode == "fp" else "Matryoshka (0.1+0.9 bit)"
     
     # Tokenize prompt
     chat_messages = [{"role": "user", "content": args.prompt}]
@@ -480,6 +521,8 @@ def main():
     # === Speculative Decoding ===
     logger.info(f"\n{'='*60}")
     logger.info(f"Speculative Decoding (K={args.draft_length}, mode={args.mode})")
+    logger.info(f"  Draft:  0.1-bit quantized")
+    logger.info(f"  Target: {target_desc}")
     logger.info(f"{'='*60}")
     
     output_ids, spec_stats = speculative_decode(
@@ -499,6 +542,7 @@ def main():
     
     print(f"\n{'='*60}")
     print(f"SPECULATIVE DECODING RESULTS")
+    print(f"  Draft:  0.1-bit | Target: {target_desc}")
     print(f"{'='*60}")
     print(f"Generated text:\n{generated_text}")
     print(f"\nStatistics:")
@@ -511,7 +555,7 @@ def main():
     # === Baseline comparison ===
     if args.compare_baseline:
         logger.info(f"\n{'='*60}")
-        logger.info("Autoregressive Baseline (target-only)")
+        logger.info(f"Autoregressive Baseline ({target_desc})")
         logger.info(f"{'='*60}")
         
         baseline_ids, baseline_stats = autoregressive_generate(
@@ -527,7 +571,7 @@ def main():
         baseline_text = tokenizer.decode(baseline_ids[0], skip_special_tokens=True)
         
         print(f"\n{'='*60}")
-        print(f"AUTOREGRESSIVE BASELINE RESULTS")
+        print(f"AUTOREGRESSIVE BASELINE RESULTS ({target_desc})")
         print(f"{'='*60}")
         print(f"Generated text:\n{baseline_text}")
         print(f"\nStatistics:")
