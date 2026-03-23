@@ -137,22 +137,34 @@ def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2
     # --- Part 2: ShareGPT ---
     sharegpt_texts = []
     if sharegpt_path and os.path.exists(sharegpt_path):
-        import json as _json
         logger.info(f"Loading ShareGPT data from local path: {sharegpt_path}")
-        with open(sharegpt_path, "r", encoding="utf-8") as f:
-            first_char = f.read(1)
-            f.seek(0)
-            if first_char == '[':
-                data = _json.load(f)
-                for item in data:
-                    _extract_sharegpt_turns(item, sharegpt_texts)
-            else:
-                for line in f:
-                    try:
-                        item = _json.loads(line.strip())
+
+        # Detect file type: raw text (.txt) vs JSON/JSONL
+        if sharegpt_path.endswith('.txt'):
+            # Raw text file - read directly
+            with open(sharegpt_path, "r", encoding="utf-8") as f:
+                sharegpt_text_raw = f.read()
+            logger.info(f"  Loaded raw text: {len(sharegpt_text_raw):,} characters")
+            # Use directly instead of building from turns
+            sharegpt_texts = None  # signal to use sharegpt_text_raw directly
+        else:
+            # JSON or JSONL file
+            import json as _json
+            with open(sharegpt_path, "r", encoding="utf-8") as f:
+                first_char = f.read(1)
+                f.seek(0)
+                if first_char == '[':
+                    data = _json.load(f)
+                    for item in data:
                         _extract_sharegpt_turns(item, sharegpt_texts)
-                    except _json.JSONDecodeError:
-                        continue
+                else:
+                    for line in f:
+                        try:
+                            item = _json.loads(line.strip())
+                            _extract_sharegpt_turns(item, sharegpt_texts)
+                        except _json.JSONDecodeError:
+                            continue
+            logger.info(f"  Loaded {len(sharegpt_texts)} conversation turns")
     else:
         logger.info("Downloading ShareGPT JSON directly from HuggingFace...")
         try:
@@ -161,7 +173,6 @@ def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2
             sources = [
                 ("anon8231489123/ShareGPT_Vicuna_unfiltered", [
                     "ShareGPT_V3_unfiltered_cleaned_split.json",
-                    "ShareGPT_V3_unfiltered_cleaned_split_no_imsorry.json",
                 ]),
                 ("RyokoAI/ShareGPT52K", [
                     "old/sg_52k.json",
@@ -186,20 +197,30 @@ def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2
         except Exception as e:
             logger.warning(f"Failed to load ShareGPT from HuggingFace: {e}. Using wikitext2 only.")
 
-    sharegpt_text = "\n\n".join(sharegpt_texts) if sharegpt_texts else ""
+    # Build sharegpt_text
+    if sharegpt_texts is None:
+        # Raw text was loaded directly
+        sharegpt_text = sharegpt_text_raw
+    else:
+        sharegpt_text = "\n\n".join(sharegpt_texts) if sharegpt_texts else ""
 
     # --- Combine ---
     combined_text = wiki_text + "\n\n" + sharegpt_text if sharegpt_text else wiki_text
+    logger.info(f"Combined text: {len(combined_text):,} characters")
 
-    combined_dataset = datasets.Dataset.from_dict({"text": [combined_text]})
-    combined_dataset = (
-        combined_dataset
-        .add_column(name="timestamp", column=[None for _ in range(len(combined_dataset["text"]))])
-        .add_column(name="url", column=combined_dataset["text"])
-    )
+    # Split into manageable chunks (~1MB each) to avoid tokenization bottleneck
+    CHUNK_SIZE = 1_000_000  # 1MB per chunk
+    text_chunks = []
+    for i in range(0, len(combined_text), CHUNK_SIZE):
+        chunk = combined_text[i:i + CHUNK_SIZE]
+        if chunk.strip():
+            text_chunks.append(chunk)
+    logger.info(f"Split into {len(text_chunks)} chunks for tokenization")
+
+    combined_dataset = datasets.Dataset.from_dict({"text": text_chunks})
 
     column_names = list(combined_dataset.features)
-    text_column_name = "text" if "text" in column_names else column_names[0]
+    text_column_name = "text"
 
     def tokenize_function(examples):
         return tokenizer(examples[text_column_name])
@@ -208,6 +229,8 @@ def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2
         tokenize_function,
         batched=True,
         remove_columns=column_names,
+        num_proc=4,
+        desc="Tokenizing",
     )
 
     block_size = seqlen
@@ -224,7 +247,7 @@ def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2
         result["labels"] = result["input_ids"].copy()
         return result
 
-    processed_dataset = tokenized_datasets.map(group_texts, batched=True)
+    processed_dataset = tokenized_datasets.map(group_texts, batched=True, desc="Chunking")
     logger.info(f"wikitext2_sharegpt dataset prepared: {len(processed_dataset)} samples")
     return processed_dataset
 
