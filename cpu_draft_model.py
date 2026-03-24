@@ -46,8 +46,60 @@ logger = setup_logger(__name__)
 # C++ op wrappers — fall back to Python if not available
 # ============================================================================
 
+_NEW_OPS_LOADED = False
+
+def _ensure_new_ops():
+    """Force-load the C++ extension if new ops are not yet available.
+    
+    The runtime.py build_extension() may early-return if old ops are cached,
+    so we need to explicitly load the freshly-built .so with the new ops.
+    """
+    global _NEW_OPS_LOADED
+    if _NEW_OPS_LOADED:
+        return
+    
+    # Check if new ops are already available
+    if (hasattr(torch.ops, "littlebit_cpu_ops") 
+        and hasattr(torch.ops.littlebit_cpu_ops, "embedding_lookup")):
+        _NEW_OPS_LOADED = True
+        return
+    
+    # Try to force-load from built .so
+    try:
+        from torch.utils.cpp_extension import load
+        import shutil
+        
+        kernels_dir = _LB_KERNELS_ROOT / "littlebit_kernels_cpu"
+        source_file = kernels_dir / "littlebit_cpu.cpp"
+        build_dir = kernels_dir / "build"
+        
+        if source_file.exists():
+            # Clear old build to force fresh compilation with new ops
+            if build_dir.exists():
+                # Check if .so already exists (from script build step)
+                so_files = list(build_dir.glob("*.so"))
+                if so_files:
+                    logger.info(f"Force-loading extension from {so_files[0]}...")
+            
+            build_dir.mkdir(parents=True, exist_ok=True)
+            load(
+                name="littlebit_cpu_ops",
+                sources=[str(source_file)],
+                build_directory=str(build_dir),
+                extra_cflags=["-O3", "-march=native"],
+                with_cuda=False,
+                is_python_module=False,
+                verbose=False,
+            )
+            _NEW_OPS_LOADED = True
+            logger.info("New C++ ops force-loaded successfully")
+    except Exception as e:
+        logger.warning(f"Could not force-load C++ extension: {e}")
+
+
 def _has_cpp_op(name: str) -> bool:
     """Check if a C++ op is available."""
+    _ensure_new_ops()
     return (
         hasattr(torch.ops, "littlebit_cpu_ops")
         and hasattr(torch.ops.littlebit_cpu_ops, name)
