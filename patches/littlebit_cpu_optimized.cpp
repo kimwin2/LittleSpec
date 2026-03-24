@@ -893,6 +893,137 @@ at::Tensor silu_mul_cpu(
     return output;
 }
 
+at::Tensor fused_attention_cpu(
+    const at::Tensor & q_flat,
+    const at::Tensor & k_cache,
+    const at::Tensor & v_cache,
+    const at::Tensor & k_new_flat,
+    const at::Tensor & v_new_flat,
+    int64_t position,
+    int64_t num_kv_heads,
+    int64_t kv_repeat,
+    int64_t head_dim,
+    double attn_scale) {
+    // q_flat: [1, num_heads * head_dim] where num_heads = num_kv_heads * kv_repeat
+    // k_cache: [num_kv_heads, max_seq_len, head_dim]
+    // v_cache: [num_kv_heads, max_seq_len, head_dim]
+    // k_new_flat: [1, num_kv_heads * head_dim]
+    // v_new_flat: [1, num_kv_heads * head_dim]
+    // Returns: [1, num_heads * head_dim]
+
+    check_float32_tensor(q_flat, "q_flat");
+    check_float32_tensor(k_cache, "k_cache");
+    check_float32_tensor(v_cache, "v_cache");
+    check_float32_tensor(k_new_flat, "k_new_flat");
+    check_float32_tensor(v_new_flat, "v_new_flat");
+
+    const int64_t num_heads = num_kv_heads * kv_repeat;
+    const int64_t max_seq = k_cache.size(1);
+    const int64_t seq_len = position + 1;  // including current position
+    const float scale = static_cast<float>(attn_scale);
+
+    // Write new K, V to cache
+    auto * k_cache_ptr = k_cache.data_ptr<float>();
+    auto * v_cache_ptr = v_cache.data_ptr<float>();
+    const auto * k_new_ptr = k_new_flat.data_ptr<float>();
+    const auto * v_new_ptr = v_new_flat.data_ptr<float>();
+
+    for (int64_t h = 0; h < num_kv_heads; ++h) {
+        std::memcpy(
+            k_cache_ptr + h * max_seq * head_dim + position * head_dim,
+            k_new_ptr + h * head_dim,
+            head_dim * sizeof(float));
+        std::memcpy(
+            v_cache_ptr + h * max_seq * head_dim + position * head_dim,
+            v_new_ptr + h * head_dim,
+            head_dim * sizeof(float));
+    }
+
+    // Output
+    auto output = at::empty({1, num_heads * head_dim}, q_flat.options());
+    auto * out_ptr = output.data_ptr<float>();
+    const auto * q_ptr = q_flat.data_ptr<float>();
+
+    // For each KV head group
+    for (int64_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
+        const float * k_base = k_cache_ptr + kv_h * max_seq * head_dim;
+        const float * v_base = v_cache_ptr + kv_h * max_seq * head_dim;
+
+        // Process each query head in this KV group
+        for (int64_t r = 0; r < kv_repeat; ++r) {
+            const int64_t q_head = kv_h * kv_repeat + r;
+            const float * q_head_ptr = q_ptr + q_head * head_dim;
+            float * out_head_ptr = out_ptr + q_head * head_dim;
+
+            // Compute attention scores: Q @ K^T for each position
+            // scores[t] = sum_d(q[d] * k[t][d]) * scale
+            thread_local std::vector<float> scores_buf;
+            scores_buf.resize(seq_len);
+            float * scores = scores_buf.data();
+
+            for (int64_t t = 0; t < seq_len; ++t) {
+                const float * k_t = k_base + t * head_dim;
+                float dot = 0.0f;
+#ifdef __AVX2__
+                __m256 acc = _mm256_setzero_ps();
+                int64_t d = 0;
+                for (; d + 8 <= head_dim; d += 8) {
+                    acc = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(q_head_ptr + d),
+                        _mm256_loadu_ps(k_t + d), acc);
+                }
+                alignas(32) float tmp[8];
+                _mm256_storeu_ps(tmp, acc);
+                for (int i = 0; i < 8; ++i) dot += tmp[i];
+                for (; d < head_dim; ++d) dot += q_head_ptr[d] * k_t[d];
+#else
+                for (int64_t d = 0; d < head_dim; ++d)
+                    dot += q_head_ptr[d] * k_t[d];
+#endif
+                scores[t] = dot * scale;
+            }
+
+            // Softmax
+            float max_score = scores[0];
+            for (int64_t t = 1; t < seq_len; ++t)
+                max_score = std::max(max_score, scores[t]);
+
+            float sum_exp = 0.0f;
+            for (int64_t t = 0; t < seq_len; ++t) {
+                scores[t] = std::exp(scores[t] - max_score);
+                sum_exp += scores[t];
+            }
+            const float inv_sum = 1.0f / sum_exp;
+            for (int64_t t = 0; t < seq_len; ++t)
+                scores[t] *= inv_sum;
+
+            // Context: probs @ V
+            // out[d] = sum_t(probs[t] * v[t][d])
+            std::memset(out_head_ptr, 0, head_dim * sizeof(float));
+            for (int64_t t = 0; t < seq_len; ++t) {
+                const float prob = scores[t];
+                const float * v_t = v_base + t * head_dim;
+#ifdef __AVX2__
+                const __m256 prob_vec = _mm256_set1_ps(prob);
+                int64_t d = 0;
+                for (; d + 8 <= head_dim; d += 8) {
+                    __m256 out_v = _mm256_loadu_ps(out_head_ptr + d);
+                    out_v = _mm256_fmadd_ps(prob_vec, _mm256_loadu_ps(v_t + d), out_v);
+                    _mm256_storeu_ps(out_head_ptr + d, out_v);
+                }
+                for (; d < head_dim; ++d)
+                    out_head_ptr[d] += prob * v_t[d];
+#else
+                for (int64_t d = 0; d < head_dim; ++d)
+                    out_head_ptr[d] += prob * v_t[d];
+#endif
+            }
+        }
+    }
+
+    return output;
+}
+
 }  // namespace littlebit_cpu_ops
 
 TORCH_LIBRARY(littlebit_cpu_ops, m) {
@@ -908,6 +1039,14 @@ TORCH_LIBRARY(littlebit_cpu_ops, m) {
     m.def("rms_norm(Tensor input, Tensor weight, float eps) -> Tensor");
     m.def("dense_gemv_f32(Tensor input, Tensor weight) -> Tensor");
     m.def("silu_mul(Tensor gate, Tensor up) -> Tensor");
+    m.def(
+        "fused_attention("
+        "Tensor q, Tensor k_cache, Tensor v_cache, "
+        "Tensor k_new, Tensor v_new, "
+        "int position, int num_kv_heads, int kv_repeat, "
+        "int head_dim, float attn_scale"
+        ") -> Tensor"
+    );
 }
 
 TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
@@ -918,4 +1057,5 @@ TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
     m.impl("rms_norm", littlebit_cpu_ops::rms_norm_cpu);
     m.impl("dense_gemv_f32", littlebit_cpu_ops::dense_gemv_f32_cpu);
     m.impl("silu_mul", littlebit_cpu_ops::silu_mul_cpu);
+    m.impl("fused_attention", littlebit_cpu_ops::fused_attention_cpu);
 }

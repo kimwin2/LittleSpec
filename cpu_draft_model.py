@@ -210,7 +210,7 @@ class CPUDraftModel:
         self._last_hidden = None   # Last hidden state from transformer
 
         # Log C++ op availability
-        cpp_ops = ["embedding_lookup", "rms_norm", "dense_gemv_f32", "silu_mul"]
+        cpp_ops = ["embedding_lookup", "rms_norm", "dense_gemv_f32", "silu_mul", "fused_attention"]
         avail = [name for name in cpp_ops if _has_cpp_op(name)]
         logger.info(f"C++ ops available: {avail if avail else 'none (using Python fallback)'}")
         logger.info("CPU draft model ready")
@@ -280,24 +280,35 @@ class CPUDraftModel:
             v = lb_linear_fn(normed, layer.v_proj).to(torch.float32)
             if profile: t_lb += time.perf_counter() - t0
             
-            # Attention with KV cache
+            # Attention with KV cache (C++ fused op or Python fallback)
             t0 = time.perf_counter() if profile else 0
-            q_grouped = _group_query_heads(
-                q,
-                num_key_value_heads=self.config.num_key_value_heads,
-                kv_repeat=self.lb_model.kv_repeat,
-                head_dim=self.lb_model.head_dim,
-            )
-            keys, values = _cache_write_grouped(
-                layer_cache, k, v,
-                position=self._cache_pos,
-                num_key_value_heads=self.config.num_key_value_heads,
-                head_dim=self.lb_model.head_dim,
-            )
-            attn_out = _grouped_attention_context(
-                q_grouped, keys, values,
-                attn_scale=self.lb_model.attn_scale,
-            )
+            if _has_cpp_op("fused_attention"):
+                attn_out = torch.ops.littlebit_cpu_ops.fused_attention(
+                    q.contiguous(), layer_cache.key, layer_cache.value,
+                    k.contiguous(), v.contiguous(),
+                    self._cache_pos,
+                    self.config.num_key_value_heads,
+                    self.lb_model.kv_repeat,
+                    self.lb_model.head_dim,
+                    self.lb_model.attn_scale,
+                )
+            else:
+                q_grouped = _group_query_heads(
+                    q,
+                    num_key_value_heads=self.config.num_key_value_heads,
+                    kv_repeat=self.lb_model.kv_repeat,
+                    head_dim=self.lb_model.head_dim,
+                )
+                keys, values = _cache_write_grouped(
+                    layer_cache, k, v,
+                    position=self._cache_pos,
+                    num_key_value_heads=self.config.num_key_value_heads,
+                    head_dim=self.lb_model.head_dim,
+                )
+                attn_out = _grouped_attention_context(
+                    q_grouped, keys, values,
+                    attn_scale=self.lb_model.attn_scale,
+                )
             if profile: t_attn += time.perf_counter() - t0
             
             t0 = time.perf_counter() if profile else 0
