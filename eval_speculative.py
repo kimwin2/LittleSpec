@@ -40,7 +40,7 @@ from speculative_decoding import (
     MatryoshkaDraftModel, MatryoshkaTargetModel, FPTargetModel,
     speculative_decode, speculative_decode_tree,
     autoregressive_generate, str2bool,
-    load_target_model,
+    load_target_model, load_draft_model,
 )
 from tree_utils import generate_tree_buffers, TREE_PRESETS
 from utils.datautils import load_tokenizer
@@ -422,6 +422,9 @@ def main():
     parser.add_argument("--mode", type=str, default="greedy", choices=["greedy", "sampling"])
     parser.add_argument("--output_file", type=str, default="eval_results/speculative_eval.json")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--draft_device", type=str, default="cuda",
+                        choices=["cuda", "cpu_kernel"],
+                        help="Device for draft model: 'cuda'=GPU PyTorch, 'cpu_kernel'=CPU LittleBit kernel")
     
     args = parser.parse_args()
     
@@ -438,9 +441,7 @@ def main():
     
     # Load models
     logger.info("Loading draft model (0.1-bit)...")
-    draft_model = MatryoshkaDraftModel(
-        args.draft_model_path, torch_dtype=torch.bfloat16, device=str(device)
-    )
+    draft_model = load_draft_model(args, device)
     
     logger.info(f"Loading target model ({target_desc})...")
     target_model = load_target_model(args, device)

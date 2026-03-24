@@ -635,6 +635,24 @@ def load_target_model(args, device):
         raise ValueError(f"Unknown target_mode: {args.target_mode}")
 
 
+def load_draft_model(args, device):
+    """Load draft model based on draft_device."""
+    draft_device = getattr(args, 'draft_device', 'cuda')
+    
+    if draft_device == "cpu_kernel":
+        logger.info("Loading draft model with CPU kernel...")
+        from cpu_draft_model import CPUDraftModel
+        return CPUDraftModel(
+            runtime_path=args.draft_model_path,
+            base_model_id=args.base_model_id,
+        )
+    else:
+        logger.info("Loading draft model (0.1-bit, GPU)...")
+        return MatryoshkaDraftModel(
+            args.draft_model_path, torch_dtype=torch.bfloat16, device=str(device)
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Speculative Decoding with Matryoshka LittleBit")
     parser.add_argument("--base_model_id", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
@@ -665,6 +683,9 @@ def main():
     parser.add_argument("--compare_baseline", type=str2bool, default=True,
                         help="Also run autoregressive baseline for comparison")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--draft_device", type=str, default="cuda",
+                        choices=["cuda", "cpu_kernel"],
+                        help="Device for draft model: 'cuda'=GPU PyTorch, 'cpu_kernel'=CPU LittleBit kernel")
     
     args = parser.parse_args()
     
@@ -677,10 +698,7 @@ def main():
     eos_token_id = tokenizer.eos_token_id or 2
     
     # Load models
-    logger.info("Loading draft model (0.1-bit)...")
-    draft_model = MatryoshkaDraftModel(
-        args.draft_model_path, torch_dtype=torch.bfloat16, device=str(device)
-    )
+    draft_model = load_draft_model(args, device)
     
     target_model = load_target_model(args, device)
     
