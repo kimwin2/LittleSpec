@@ -54,9 +54,18 @@ class KDTrainer(Trainer):
 
         loss = kd_loss + l2l_loss
 
+        # Top-1 accuracy: student vs teacher argmax match rate
+        with torch.no_grad():
+            teacher_argmax = teacher_logits.argmax(dim=-1)  # (B, S)
+            student_argmax = student_logits.argmax(dim=-1)
+            attn_mask = inputs.get("attention_mask", torch.ones_like(teacher_argmax))
+            valid_tokens = attn_mask.sum().item()
+            acc_0 = ((student_argmax == teacher_argmax) * attn_mask).sum().item() / max(valid_tokens, 1)
+
         self.log({
             "l2l_loss": l2l_loss.item(),
             "kd_loss": kd_loss.item(),
+            "acc_0": acc_0,
         })
 
         return (loss, outputs) if return_outputs else loss
