@@ -697,6 +697,272 @@ at::Tensor littlebit_linear_cpu(
 }
 
 // ============================================================================
+// BitNet-style i2 (2-bit packed binary) kernel
+// ============================================================================
+
+// Repack int32-packed sign bits to byte-packed 2-bit format (BitNet format)
+// Input: int32[ceil(K/32)] where each bit = 1 sign (bit=1 → -1, bit=0 → +1)
+// Output: uint8[ceil(K/4)] where each byte holds 4 × 2-bit values:
+//   byte = (v0 << 6) | (v1 << 4) | (v2 << 2) | v3
+//   with encoding: +1 → 2, -1 → 0
+at::Tensor repack_signs_to_i2_cpu(
+    const at::Tensor & packed_signs,
+    int64_t n_cols) {
+    check_cpu_tensor(packed_signs, "packed_signs");
+    TORCH_CHECK(packed_signs.scalar_type() == at::kInt, "packed_signs must be int32");
+
+    // Each row: ceil(K/32) int32 words → K signs → ceil(K/4) bytes in i2 format
+    const auto n_rows = packed_signs.size(0);
+    const int64_t i2_bytes_per_row = (n_cols + 3) / 4;
+    const int64_t words_per_row = packed_signs.size(1);
+
+    auto output = at::zeros({n_rows, i2_bytes_per_row}, packed_signs.options().dtype(at::kByte));
+
+    const auto * src_ptr = packed_signs.data_ptr<int32_t>();
+    auto * dst_ptr = output.data_ptr<uint8_t>();
+
+    at::parallel_for(0, n_rows, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            const int32_t * src_row = src_ptr + row * words_per_row;
+            uint8_t * dst_row = dst_ptr + row * i2_bytes_per_row;
+
+            for (int64_t col = 0; col < n_cols; ++col) {
+                const int64_t word_idx = col / 32;
+                const int64_t bit_idx = col % 32;
+                const bool is_neg = ((static_cast<uint32_t>(src_row[word_idx]) >> bit_idx) & 1U) != 0;
+
+                // Encoding: +1 → 2, -1 → 0
+                const uint8_t i2_val = is_neg ? 0 : 2;
+
+                // Pack 4 i2 values per byte: groups of 32 elements like BitNet
+                // BitNet layout: within each block of 128 elements,
+                //   positions [0..31] go to shift 6 (group 0)
+                //   positions [32..63] go to shift 4 (group 1)
+                //   positions [64..95] go to shift 2 (group 2)
+                //   positions [96..127] go to shift 0 (group 3)
+                // Byte index within block = position % 32
+                // Block index = position / 128
+                const int64_t block_idx = col / 128;
+                const int64_t pos_in_block = col % 128;
+                const int64_t group_idx = pos_in_block / 32;  // 0-3
+                const int64_t group_pos = pos_in_block % 32;  // 0-31
+                const int64_t byte_offset = block_idx * 32 + group_pos;
+
+                if (byte_offset < i2_bytes_per_row) {
+                    const int shift = 6 - 2 * static_cast<int>(group_idx);
+                    dst_row[byte_offset] |= (i2_val << shift);
+                }
+            }
+        }
+    });
+
+    return output;
+}
+
+#ifdef __AVX2__
+// BitNet MAD-style dot product: int8 input × 2-bit packed binary weights
+// Returns raw maddubs accumulation (needs sum_all correction afterwards)
+inline int32_t dot_int8_x_i2_block_avx2(
+    const int8_t * input,   // 128 int8 values
+    const uint8_t * weight  // 32 bytes = 128 × 2-bit values
+) {
+    const __m256i mask = _mm256_set1_epi8(0x03);
+
+    // Load 32 bytes of packed weights → 128 2-bit values
+    __m256i xq8_3 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weight));
+    __m256i xq8_2 = _mm256_srli_epi16(xq8_3, 2);
+    __m256i xq8_1 = _mm256_srli_epi16(xq8_3, 4);
+    __m256i xq8_0 = _mm256_srli_epi16(xq8_3, 6);
+
+    xq8_3 = _mm256_and_si256(xq8_3, mask);
+    xq8_2 = _mm256_and_si256(xq8_2, mask);
+    xq8_1 = _mm256_and_si256(xq8_1, mask);
+    xq8_0 = _mm256_and_si256(xq8_0, mask);
+
+    // Load 4 × 32 = 128 int8 input values
+    __m256i yq8_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input));
+    __m256i yq8_1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input + 32));
+    __m256i yq8_2 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input + 64));
+    __m256i yq8_3 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input + 96));
+
+    // maddubs: unsigned weight × signed input → int16 pair sums
+    xq8_0 = _mm256_maddubs_epi16(xq8_0, yq8_0);
+    xq8_1 = _mm256_maddubs_epi16(xq8_1, yq8_1);
+    xq8_2 = _mm256_maddubs_epi16(xq8_2, yq8_2);
+    xq8_3 = _mm256_maddubs_epi16(xq8_3, yq8_3);
+
+    // Sum all into int16
+    __m256i accu16 = _mm256_add_epi16(_mm256_add_epi16(xq8_0, xq8_1),
+                                       _mm256_add_epi16(xq8_2, xq8_3));
+
+    // Widen int16 → int32
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256i accu32 = _mm256_madd_epi16(accu16, ones16);
+
+    return hsum_epi32(accu32);
+}
+
+// Sum all int8 values in a row (precomputed once per quantization)
+inline int32_t sum_int8_row_avx2(const int8_t * data, int64_t n) {
+    int32_t sum = 0;
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256i acc32 = _mm256_setzero_si256();
+
+    int64_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data + i));
+        // Sum pairs: maddubs(ones_unsigned, signed_v) = pairwise sums as int16
+        const __m256i sum16 = _mm256_maddubs_epi16(
+            _mm256_abs_epi8(v), _mm256_sign_epi8(ones8, v));
+        acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(sum16, ones16));
+    }
+    sum = hsum_epi32(acc32);
+    for (; i < n; ++i) sum += static_cast<int32_t>(data[i]);
+    return sum;
+}
+
+// Full row dot product: int8 × i2 packed weights with sum_all correction
+// true_dot = maddubs_result - sum_all(input)
+// Because encoding is +1→2, -1→0:
+//   maddubs gives 2*sum(input where sign=+1)
+//   true_dot = 2*sum(input_pos) - sum_all
+//            = maddubs_result - sum_all
+inline int32_t dot_int8_x_i2_row_avx2(
+    const int8_t * input_row,
+    const uint8_t * weight_i2_row,
+    int64_t n_cols,
+    int32_t sum_all) {
+    const int64_t n_blocks = n_cols / 128;
+    const int64_t tail = n_cols % 128;
+
+    int32_t maddubs_sum = 0;
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        maddubs_sum += dot_int8_x_i2_block_avx2(
+            input_row + b * 128,
+            weight_i2_row + b * 32);
+    }
+
+    // Tail: scalar fallback for remaining elements
+    if (tail > 0) {
+        const int8_t * input_tail = input_row + n_blocks * 128;
+        const uint8_t * weight_tail = weight_i2_row + n_blocks * 32;
+        for (int64_t c = 0; c < tail; ++c) {
+            const int64_t group_idx = c / 32;
+            const int64_t group_pos = c % 32;
+            if (group_pos < 32 && (n_blocks * 32 + group_pos) < ((n_cols + 3) / 4)) {
+                const int shift = 6 - 2 * static_cast<int>(group_idx);
+                const uint8_t i2_val = (weight_tail[group_pos] >> shift) & 0x03;
+                // i2_val is 0 or 2: weight = i2_val - 1 gives -1 or +1
+                const int32_t sign_val = static_cast<int32_t>(i2_val) - 1;
+                maddubs_sum += static_cast<int32_t>(input_tail[c]) * (sign_val + 1);
+                // Actually simpler: maddubs would give i2_val * input
+                // We accumulate the same way
+            }
+        }
+    }
+
+    return maddubs_sum - sum_all;
+}
+#endif  // __AVX2__
+
+at::Tensor littlebit_linear_i2_cpu(
+    const at::Tensor & input,
+    const at::Tensor & v2,
+    const at::Tensor & v_sign_i2,
+    int64_t v_cols,
+    const at::Tensor & mid,
+    const at::Tensor & u_sign_i2,
+    int64_t u_cols,
+    const at::Tensor & u1) {
+    check_float32_tensor(input, "input");
+    check_float32_tensor(v2, "v2");
+    check_cpu_tensor(v_sign_i2, "v_sign_i2");
+    check_float32_tensor(mid, "mid");
+    check_cpu_tensor(u_sign_i2, "u_sign_i2");
+    check_float32_tensor(u1, "u1");
+
+    TORCH_CHECK(v_sign_i2.scalar_type() == at::kByte, "v_sign_i2 must be uint8");
+    TORCH_CHECK(u_sign_i2.scalar_type() == at::kByte, "u_sign_i2 must be uint8");
+
+    const auto rows = input.size(0);
+    const auto rank = v_sign_i2.size(0);
+    const auto out_features = u_sign_i2.size(0);
+
+    auto output = at::empty({rows, out_features}, input.options().dtype(at::kFloat));
+
+    const auto * input_ptr = input.data_ptr<float>();
+    const auto * v2_ptr = v2.data_ptr<float>();
+    const auto * v_i2_ptr = v_sign_i2.data_ptr<uint8_t>();
+    const auto * mid_ptr = mid.data_ptr<float>();
+    const auto * u_i2_ptr = u_sign_i2.data_ptr<uint8_t>();
+    const auto * u1_ptr = u1.data_ptr<float>();
+    auto * out_ptr = output.data_ptr<float>();
+
+    const auto v_i2_stride = v_sign_i2.size(1);
+    const auto u_i2_stride = u_sign_i2.size(1);
+
+    struct I2Scratch {
+        std::vector<int8_t> q1;
+        std::vector<float> stage1;
+        std::vector<int8_t> q2;
+    };
+    thread_local I2Scratch scratch;
+    scratch.q1.resize(v_cols);
+    scratch.stage1.resize(rank);
+    scratch.q2.resize(rank);
+
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto * input_row = input_ptr + row * v_cols;
+
+        // Quantize input × v2 → int8
+        const float scale1 = quantize_mul_row_to_int8(input_row, v2_ptr, v_cols, scratch.q1.data());
+        const float inv_scale1 = 1.0f / scale1;
+
+#ifdef __AVX2__
+        // Precompute sum_all for the quantized input (for i2 correction)
+        const int32_t sum_all_q1 = sum_int8_row_avx2(scratch.q1.data(), v_cols);
+
+        // Stage 1: V projection using i2 BitNet kernel
+        parallel_for_maybe_serial(0, rank, 256, [&](int64_t begin, int64_t end) {
+            for (int64_t rank_idx = begin; rank_idx < end; ++rank_idx) {
+                const int32_t acc = dot_int8_x_i2_row_avx2(
+                    scratch.q1.data(),
+                    v_i2_ptr + rank_idx * v_i2_stride,
+                    v_cols,
+                    sum_all_q1);
+                scratch.stage1.data()[rank_idx] = static_cast<float>(acc) * inv_scale1 * mid_ptr[rank_idx];
+            }
+        });
+
+        // Quantize stage1 → int8
+        const float scale2 = quantize_row_to_int8(scratch.stage1.data(), rank, scratch.q2.data());
+        const float inv_scale2 = 1.0f / scale2;
+
+        const int32_t sum_all_q2 = sum_int8_row_avx2(scratch.q2.data(), rank);
+
+        // Stage 2: U projection using i2 BitNet kernel
+        parallel_for_maybe_serial(0, out_features, 256, [&](int64_t begin, int64_t end) {
+            for (int64_t out_idx = begin; out_idx < end; ++out_idx) {
+                const int32_t acc = dot_int8_x_i2_row_avx2(
+                    scratch.q2.data(),
+                    u_i2_ptr + out_idx * u_i2_stride,
+                    rank,
+                    sum_all_q2);
+                out_ptr[row * out_features + out_idx] = static_cast<float>(acc) * inv_scale2 * u1_ptr[out_idx];
+            }
+        });
+#else
+        // Scalar fallback — same as original littlebit_linear_cpu
+        // (omitted for brevity, would use existing scalar path)
+        TORCH_CHECK(false, "littlebit_linear_i2 requires AVX2");
+#endif
+    }
+
+    return output;
+}
+
+// ============================================================================
 // New ops: embedding, rms_norm, dense_gemv, silu_mul
 // ============================================================================
 
@@ -1047,6 +1313,13 @@ TORCH_LIBRARY(littlebit_cpu_ops, m) {
         "int head_dim, float attn_scale"
         ") -> Tensor"
     );
+    m.def("repack_signs_to_i2(Tensor packed_signs, int n_cols) -> Tensor");
+    m.def(
+        "littlebit_linear_i2("
+        "Tensor input, Tensor v2, Tensor v_sign_i2, int v_cols, "
+        "Tensor mid, Tensor u_sign_i2, int u_cols, Tensor u1"
+        ") -> Tensor"
+    );
 }
 
 TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
@@ -1058,4 +1331,6 @@ TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
     m.impl("dense_gemv_f32", littlebit_cpu_ops::dense_gemv_f32_cpu);
     m.impl("silu_mul", littlebit_cpu_ops::silu_mul_cpu);
     m.impl("fused_attention", littlebit_cpu_ops::fused_attention_cpu);
+    m.impl("repack_signs_to_i2", littlebit_cpu_ops::repack_signs_to_i2_cpu);
+    m.impl("littlebit_linear_i2", littlebit_cpu_ops::littlebit_linear_i2_cpu);
 }

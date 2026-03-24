@@ -210,9 +210,32 @@ class CPUDraftModel:
         self._last_hidden = None   # Last hidden state from transformer
 
         # Log C++ op availability
-        cpp_ops = ["embedding_lookup", "rms_norm", "dense_gemv_f32", "silu_mul", "fused_attention"]
+        cpp_ops = ["embedding_lookup", "rms_norm", "dense_gemv_f32", "silu_mul", 
+                    "fused_attention", "repack_signs_to_i2", "littlebit_linear_i2"]
         avail = [name for name in cpp_ops if _has_cpp_op(name)]
         logger.info(f"C++ ops available: {avail if avail else 'none (using Python fallback)'}")
+        
+        # Repack sign weights to BitNet i2 format if available
+        self._i2_weights = {}  # layer_idx -> {proj_name: (v_sign_i2, u_sign_i2)}
+        self._use_i2 = False
+        if _has_cpp_op("repack_signs_to_i2") and _has_cpp_op("littlebit_linear_i2"):
+            logger.info("Repacking sign weights to BitNet i2 format...")
+            import time
+            t0 = time.perf_counter()
+            for layer_idx, layer in enumerate(self.lb_model.layers):
+                self._i2_weights[layer_idx] = {}
+                for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj", 
+                                   "gate_proj", "up_proj", "down_proj"]:
+                    rt = getattr(layer, proj_name)
+                    branch = rt.main
+                    v_sign_i2 = torch.ops.littlebit_cpu_ops.repack_signs_to_i2(
+                        branch.v_sign.contiguous(), int(branch.v_shape[1]))
+                    u_sign_i2 = torch.ops.littlebit_cpu_ops.repack_signs_to_i2(
+                        branch.u_sign.contiguous(), int(branch.u_shape[1]))
+                    self._i2_weights[layer_idx][proj_name] = (v_sign_i2, u_sign_i2)
+            self._use_i2 = True
+            logger.info(f"i2 repacking done in {time.perf_counter() - t0:.2f}s")
+        
         logger.info("CPU draft model ready")
     
     def reset(self):
@@ -230,6 +253,29 @@ class CPUDraftModel:
         """Project hidden state to logits via C++ dense GEMV."""
         return _cpp_lm_head(hidden, self.lm_head_weight)
     
+    def _lb_linear(self, x: torch.Tensor, runtime, layer_idx: int, proj_name: str) -> torch.Tensor:
+        """LittleBit linear using i2 BitNet kernel if available, else original."""
+        branch = runtime.main
+        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float32).contiguous()
+        
+        if self._use_i2 and layer_idx in self._i2_weights and proj_name in self._i2_weights[layer_idx]:
+            v_sign_i2, u_sign_i2 = self._i2_weights[layer_idx][proj_name]
+            out = torch.ops.littlebit_cpu_ops.littlebit_linear_i2(
+                x_2d,
+                branch.v2.to(torch.float32).contiguous(),
+                v_sign_i2.contiguous(),
+                int(branch.v_shape[1]),
+                branch.mid.to(torch.float32).contiguous(),
+                u_sign_i2.contiguous(),
+                int(branch.u_shape[1]),
+                branch.u1.to(torch.float32).contiguous(),
+            )
+        else:
+            from littlebit_kernels_cpu.runtime import littlebit_linear as lb_linear_fn
+            out = lb_linear_fn(x, runtime)
+            return out
+        return out.reshape(*x.shape[:-1], branch.u_shape[0])
+    
     def _ensure_cache(self):
         """Allocate KV cache if not yet allocated."""
         if self._cache is None:
@@ -240,7 +286,7 @@ class CPUDraftModel:
     @torch.no_grad()
     def _forward_token(self, token_id: int, profile: bool = False) -> torch.Tensor:
         """Process a single token through the transformer, updating KV cache.
-        Uses C++ ops for RMSNorm and SiLU where available.
+        Uses C++ ops for RMSNorm, SiLU, attention, and i2 kernel where available.
         Returns the hidden state (1, hidden_size).
         If profile=True, logs time breakdown.
         """
@@ -256,8 +302,7 @@ class CPUDraftModel:
         hidden = hidden.reshape(1, self.config.hidden_size)
         if profile: t_embed += time.perf_counter() - t0
         
-        # Run through all layers using C++ RMSNorm and SiLU
-        from littlebit_kernels_cpu.runtime import littlebit_linear as lb_linear_fn
+        # Run through all layers
         from littlebit_kernels_cpu.dummy_model import (
             _group_query_heads, _cache_write_grouped, _grouped_attention_context
         )
@@ -265,7 +310,7 @@ class CPUDraftModel:
         x = hidden.to(torch.float32)
         eps = self.config.rms_norm_eps
         
-        for layer, layer_cache in zip(self.lb_model.layers, self._cache):
+        for layer_idx, (layer, layer_cache) in enumerate(zip(self.lb_model.layers, self._cache)):
             residual = x
             
             # RMSNorm
@@ -273,11 +318,11 @@ class CPUDraftModel:
             normed = _cpp_rms_norm(x, layer.input_layernorm_weight, eps)
             if profile: t_rms += time.perf_counter() - t0
             
-            # Q, K, V, O projections (LittleBit kernel)
+            # Q, K, V projections (i2 BitNet kernel or original)
             t0 = time.perf_counter() if profile else 0
-            q = lb_linear_fn(normed, layer.q_proj).to(torch.float32)
-            k = lb_linear_fn(normed, layer.k_proj).to(torch.float32)
-            v = lb_linear_fn(normed, layer.v_proj).to(torch.float32)
+            q = self._lb_linear(normed, layer.q_proj, layer_idx, "q_proj").to(torch.float32)
+            k = self._lb_linear(normed, layer.k_proj, layer_idx, "k_proj").to(torch.float32)
+            v = self._lb_linear(normed, layer.v_proj, layer_idx, "v_proj").to(torch.float32)
             if profile: t_lb += time.perf_counter() - t0
             
             # Attention with KV cache (C++ fused op or Python fallback)
@@ -312,7 +357,7 @@ class CPUDraftModel:
             if profile: t_attn += time.perf_counter() - t0
             
             t0 = time.perf_counter() if profile else 0
-            x = residual + lb_linear_fn(attn_out, layer.o_proj).to(torch.float32)
+            x = residual + self._lb_linear(attn_out, layer.o_proj, layer_idx, "o_proj").to(torch.float32)
             if profile: t_lb += time.perf_counter() - t0
             
             # MLP
@@ -322,8 +367,8 @@ class CPUDraftModel:
             if profile: t_rms += time.perf_counter() - t0
             
             t0 = time.perf_counter() if profile else 0
-            gate = lb_linear_fn(mlp_in, layer.gate_proj).to(torch.float32)
-            up = lb_linear_fn(mlp_in, layer.up_proj).to(torch.float32)
+            gate = self._lb_linear(mlp_in, layer.gate_proj, layer_idx, "gate_proj").to(torch.float32)
+            up = self._lb_linear(mlp_in, layer.up_proj, layer_idx, "up_proj").to(torch.float32)
             if profile: t_lb += time.perf_counter() - t0
             
             t0 = time.perf_counter() if profile else 0
@@ -331,7 +376,7 @@ class CPUDraftModel:
             if profile: t_silu += time.perf_counter() - t0
             
             t0 = time.perf_counter() if profile else 0
-            x = residual + lb_linear_fn(mlp_hidden, layer.down_proj).to(torch.float32)
+            x = residual + self._lb_linear(mlp_hidden, layer.down_proj, layer_idx, "down_proj").to(torch.float32)
             if profile: t_lb += time.perf_counter() - t0
         
         # Final RMSNorm (C++ op)
