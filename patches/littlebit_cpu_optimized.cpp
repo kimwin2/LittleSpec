@@ -696,6 +696,203 @@ at::Tensor littlebit_linear_cpu(
     return output;
 }
 
+// ============================================================================
+// New ops: embedding, rms_norm, dense_gemv, silu_mul
+// ============================================================================
+
+at::Tensor embedding_lookup_cpu(
+    const at::Tensor & weight,
+    const at::Tensor & indices) {
+    // weight: [vocab, hidden], indices: [N] or [1, N] -> output: [N, hidden]
+    check_float32_tensor(weight, "weight");
+    check_cpu_tensor(indices, "indices");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [vocab, hidden]");
+
+    auto flat_indices = indices.reshape({-1});
+    const auto n_tokens = flat_indices.size(0);
+    const auto hidden = weight.size(1);
+
+    auto output = at::empty({n_tokens, hidden}, weight.options());
+    const auto * weight_ptr = weight.data_ptr<float>();
+    const auto * idx_ptr = flat_indices.data_ptr<int64_t>();
+    auto * out_ptr = output.data_ptr<float>();
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const int64_t idx = idx_ptr[i];
+        std::memcpy(out_ptr + i * hidden, weight_ptr + idx * hidden,
+                    hidden * sizeof(float));
+    }
+    return output;
+}
+
+at::Tensor rms_norm_cpu(
+    const at::Tensor & input,
+    const at::Tensor & weight,
+    double eps) {
+    check_float32_tensor(input, "input");
+    check_float32_tensor(weight, "weight");
+    // input: [1, hidden] or [hidden], weight: [hidden]
+    auto x = input.reshape({-1}).contiguous();
+    auto w = weight.reshape({-1}).contiguous();
+    const auto cols = x.size(0);
+    TORCH_CHECK(w.size(0) == cols, "weight size must match input hidden dim");
+
+    auto output = at::empty({1, cols}, x.options());
+    const auto * x_ptr = x.data_ptr<float>();
+    const auto * w_ptr = w.data_ptr<float>();
+    auto * out_ptr = output.data_ptr<float>();
+
+    // Compute sum of squares
+    float sum_sq = 0.0f;
+#ifdef __AVX2__
+    __m256 acc = _mm256_setzero_ps();
+    int64_t col = 0;
+    for (; col + 8 <= cols; col += 8) {
+        const __m256 v = _mm256_loadu_ps(x_ptr + col);
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    alignas(32) float tmp[8];
+    _mm256_storeu_ps(tmp, acc);
+    for (int i = 0; i < 8; ++i) sum_sq += tmp[i];
+    for (; col < cols; ++col) sum_sq += x_ptr[col] * x_ptr[col];
+#else
+    for (int64_t col = 0; col < cols; ++col) sum_sq += x_ptr[col] * x_ptr[col];
+#endif
+
+    const float rms_scale = 1.0f / std::sqrt(sum_sq / static_cast<float>(cols) + static_cast<float>(eps));
+
+    // Apply: out = x * rms_scale * weight
+#ifdef __AVX2__
+    const __m256 scale_vec = _mm256_set1_ps(rms_scale);
+    col = 0;
+    for (; col + 8 <= cols; col += 8) {
+        const __m256 xv = _mm256_loadu_ps(x_ptr + col);
+        const __m256 wv = _mm256_loadu_ps(w_ptr + col);
+        _mm256_storeu_ps(out_ptr + col, _mm256_mul_ps(_mm256_mul_ps(xv, scale_vec), wv));
+    }
+    for (; col < cols; ++col) {
+        out_ptr[col] = x_ptr[col] * rms_scale * w_ptr[col];
+    }
+#else
+    for (int64_t col = 0; col < cols; ++col) {
+        out_ptr[col] = x_ptr[col] * rms_scale * w_ptr[col];
+    }
+#endif
+    return output;
+}
+
+at::Tensor dense_gemv_f32_cpu(
+    const at::Tensor & input,
+    const at::Tensor & weight) {
+    // input: [1, K], weight: [N, K] -> output: [1, N]
+    // Optimized GEMV for lm_head: parallel over output rows, AVX2 FMA inner loop
+    check_float32_tensor(input, "input");
+    check_float32_tensor(weight, "weight");
+    TORCH_CHECK(input.dim() == 2, "input must be 2D");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+    TORCH_CHECK(input.size(1) == weight.size(1), "input K must match weight K");
+
+    const auto K = weight.size(1);
+    const auto N = weight.size(0);
+    auto output = at::empty({1, N}, input.options());
+
+    const auto * in_ptr = input.data_ptr<float>();
+    const auto * w_ptr = weight.data_ptr<float>();
+    auto * out_ptr = output.data_ptr<float>();
+
+    // Parallel over output rows (N ≈ 128K for lm_head)
+    at::parallel_for(0, N, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n) {
+            const auto * w_row = w_ptr + n * K;
+            float dot = 0.0f;
+#ifdef __AVX2__
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+            int64_t k = 0;
+            // 4-way unrolled: 32 floats per iteration
+            for (; k + 32 <= K; k += 32) {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(in_ptr + k),
+                                       _mm256_loadu_ps(w_row + k), acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(in_ptr + k + 8),
+                                       _mm256_loadu_ps(w_row + k + 8), acc1);
+                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(in_ptr + k + 16),
+                                       _mm256_loadu_ps(w_row + k + 16), acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(in_ptr + k + 24),
+                                       _mm256_loadu_ps(w_row + k + 24), acc3);
+            }
+            // Remaining 8-wide
+            for (; k + 8 <= K; k += 8) {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(in_ptr + k),
+                                       _mm256_loadu_ps(w_row + k), acc0);
+            }
+            // Reduce 4 accumulators
+            acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+            alignas(32) float lanes[8];
+            _mm256_storeu_ps(lanes, acc0);
+            for (int i = 0; i < 8; ++i) dot += lanes[i];
+            // Scalar tail
+            for (; k < K; ++k) dot += in_ptr[k] * w_row[k];
+#else
+            for (int64_t k = 0; k < K; ++k) dot += in_ptr[k] * w_row[k];
+#endif
+            out_ptr[n] = dot;
+        }
+    });
+
+    return output;
+}
+
+at::Tensor silu_mul_cpu(
+    const at::Tensor & gate,
+    const at::Tensor & up) {
+    // Fused: SiLU(gate) * up = gate * sigmoid(gate) * up
+    check_float32_tensor(gate, "gate");
+    check_float32_tensor(up, "up");
+    TORCH_CHECK(gate.sizes() == up.sizes(), "gate and up must have same shape");
+
+    auto output = at::empty_like(gate);
+    const auto numel = gate.numel();
+    const auto * g_ptr = gate.data_ptr<float>();
+    const auto * u_ptr = up.data_ptr<float>();
+    auto * out_ptr = output.data_ptr<float>();
+
+#ifdef __AVX2__
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 neg_one = _mm256_set1_ps(-1.0f);
+    int64_t i = 0;
+    for (; i + 8 <= numel; i += 8) {
+        const __m256 g = _mm256_loadu_ps(g_ptr + i);
+        const __m256 u = _mm256_loadu_ps(u_ptr + i);
+        // sigmoid(x) ≈ 1 / (1 + exp(-x))
+        // Compute exp(-x) via fast approximation
+        // Use the identity: sigmoid(x) = 0.5 * (1 + tanh(x/2))
+        // But for accuracy, use scalar exp. For speed, process vectorized.
+        // Fall back to scalar for now — the main savings is avoiding Python dispatch.
+        alignas(32) float gv[8], uv[8];
+        _mm256_storeu_ps(gv, g);
+        _mm256_storeu_ps(uv, u);
+        alignas(32) float rv[8];
+        for (int j = 0; j < 8; ++j) {
+            const float sig = 1.0f / (1.0f + std::exp(-gv[j]));
+            rv[j] = gv[j] * sig * uv[j];
+        }
+        _mm256_storeu_ps(out_ptr + i, _mm256_loadu_ps(rv));
+    }
+    for (; i < numel; ++i) {
+        const float sig = 1.0f / (1.0f + std::exp(-g_ptr[i]));
+        out_ptr[i] = g_ptr[i] * sig * u_ptr[i];
+    }
+#else
+    for (int64_t i = 0; i < numel; ++i) {
+        const float sig = 1.0f / (1.0f + std::exp(-g_ptr[i]));
+        out_ptr[i] = g_ptr[i] * sig * u_ptr[i];
+    }
+#endif
+    return output;
+}
+
 }  // namespace littlebit_cpu_ops
 
 TORCH_LIBRARY(littlebit_cpu_ops, m) {
@@ -707,10 +904,18 @@ TORCH_LIBRARY(littlebit_cpu_ops, m) {
         "Tensor mid, Tensor u_sign, int u_cols, Tensor u1"
         ") -> Tensor"
     );
+    m.def("embedding_lookup(Tensor weight, Tensor indices) -> Tensor");
+    m.def("rms_norm(Tensor input, Tensor weight, float eps) -> Tensor");
+    m.def("dense_gemv_f32(Tensor input, Tensor weight) -> Tensor");
+    m.def("silu_mul(Tensor gate, Tensor up) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
     m.impl("quantize_per_row_int8", littlebit_cpu_ops::quantize_per_row_int8_cpu);
     m.impl("gemv_int8xsign", littlebit_cpu_ops::gemv_int8xsign_cpu);
     m.impl("littlebit_linear", littlebit_cpu_ops::littlebit_linear_cpu);
+    m.impl("embedding_lookup", littlebit_cpu_ops::embedding_lookup_cpu);
+    m.impl("rms_norm", littlebit_cpu_ops::rms_norm_cpu);
+    m.impl("dense_gemv_f32", littlebit_cpu_ops::dense_gemv_f32_cpu);
+    m.impl("silu_mul", littlebit_cpu_ops::silu_mul_cpu);
 }

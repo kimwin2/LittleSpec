@@ -5,9 +5,8 @@ Wraps lb_kernels/littlebit_kernels_cpu's DummyLlama3LittleBitModel
 to provide the same interface as MatryoshkaDraftModel.
 
 Key design: Persistent KV cache for incremental token generation.
-- prefill() processes the initial prompt once
-- generate_draft_tokens() only processes NEW tokens incrementally
-- reset() clears KV cache when the prompt changes
+Uses C++ ops for embedding, RMSNorm, lm_head, and SiLU to eliminate
+Python overhead.
 
 Usage:
     from cpu_draft_model import CPUDraftModel
@@ -43,10 +42,54 @@ from utils.misc import setup_logger
 logger = setup_logger(__name__)
 
 
+# ============================================================================
+# C++ op wrappers — fall back to Python if not available
+# ============================================================================
+
+def _has_cpp_op(name: str) -> bool:
+    """Check if a C++ op is available."""
+    return (
+        hasattr(torch.ops, "littlebit_cpu_ops")
+        and hasattr(torch.ops.littlebit_cpu_ops, name)
+    )
+
+
+def _cpp_embedding(weight: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    """Embedding lookup via C++ op or Python fallback."""
+    if _has_cpp_op("embedding_lookup"):
+        return torch.ops.littlebit_cpu_ops.embedding_lookup(weight, token_ids)
+    return F.embedding(token_ids.to("cpu"), weight)
+
+
+def _cpp_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm via C++ op or Python fallback."""
+    if _has_cpp_op("rms_norm"):
+        return torch.ops.littlebit_cpu_ops.rms_norm(x, weight, eps)
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    return x * torch.rsqrt(variance + eps) * weight
+
+
+def _cpp_lm_head(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Dense GEMV via C++ op or Python fallback."""
+    if _has_cpp_op("dense_gemv_f32"):
+        h = hidden.reshape(1, -1).to(torch.float32).contiguous()
+        return torch.ops.littlebit_cpu_ops.dense_gemv_f32(h, weight)
+    return F.linear(hidden.to(torch.float32), weight)
+
+
+def _cpp_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Fused SiLU(gate) * up via C++ op or Python fallback."""
+    if _has_cpp_op("silu_mul"):
+        return torch.ops.littlebit_cpu_ops.silu_mul(gate.contiguous(), up.contiguous())
+    return F.silu(gate) * up
+
+
 class CPUDraftModel:
     """CPU kernel-based draft model for speculative decoding.
     
     Uses persistent KV cache for efficient incremental generation.
+    Uses C++ ops for embedding, RMSNorm, lm_head, and SiLU when available.
     """
     
     def __init__(
@@ -113,7 +156,11 @@ class CPUDraftModel:
         self._cache_pos = 0        # Next position to write in cache
         self._cached_seq_len = 0   # How many input tokens have been cached
         self._last_hidden = None   # Last hidden state from transformer
-        
+
+        # Log C++ op availability
+        cpp_ops = ["embedding_lookup", "rms_norm", "dense_gemv_f32", "silu_mul"]
+        avail = [name for name in cpp_ops if _has_cpp_op(name)]
+        logger.info(f"C++ ops available: {avail if avail else 'none (using Python fallback)'}")
         logger.info("CPU draft model ready")
     
     def reset(self):
@@ -123,13 +170,13 @@ class CPUDraftModel:
         self._cached_seq_len = 0
         self._last_hidden = None
     
-    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Lookup embeddings."""
-        return F.embedding(input_ids.to("cpu"), self.embed_tokens)
+    def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Lookup embeddings via C++ op."""
+        return _cpp_embedding(self.embed_tokens, token_ids)
     
     def _lm_head(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Project hidden state to logits."""
-        return F.linear(hidden.to(torch.float32), self.lm_head_weight)
+        """Project hidden state to logits via C++ dense GEMV."""
+        return _cpp_lm_head(hidden, self.lm_head_weight)
     
     def _ensure_cache(self):
         """Allocate KV cache if not yet allocated."""
@@ -141,17 +188,71 @@ class CPUDraftModel:
     @torch.no_grad()
     def _forward_token(self, token_id: int) -> torch.Tensor:
         """Process a single token through the transformer, updating KV cache.
+        Uses C++ ops for RMSNorm and SiLU where available.
         Returns the hidden state (1, hidden_size).
         """
         self._ensure_cache()
-        hidden = self._embed(torch.tensor([[token_id]]))  # (1, 1, hidden_size)
-        hidden = hidden.squeeze(0)  # (1, hidden_size)
-        output = self.lb_model.forward_token(
-            hidden, self._cache, self._cache_pos, compute_logits=False
+        
+        # Embedding lookup (C++ op)
+        hidden = self._embed(torch.tensor([token_id], dtype=torch.long))
+        hidden = hidden.reshape(1, self.config.hidden_size)
+        
+        # Run through all layers using C++ RMSNorm and SiLU
+        from littlebit_kernels_cpu.runtime import littlebit_linear as lb_linear_fn
+        from littlebit_kernels_cpu.dummy_model import (
+            _group_query_heads, _cache_write_grouped, _grouped_attention_context
         )
+        
+        x = hidden.to(torch.float32)
+        eps = self.config.rms_norm_eps
+        
+        for layer, layer_cache in zip(self.lb_model.layers, self._cache):
+            residual = x
+            
+            # RMSNorm (C++ op)
+            normed = _cpp_rms_norm(x, layer.input_layernorm_weight, eps)
+            
+            # Q, K, V projections (LittleBit kernel)
+            q = lb_linear_fn(normed, layer.q_proj).to(torch.float32)
+            k = lb_linear_fn(normed, layer.k_proj).to(torch.float32)
+            v = lb_linear_fn(normed, layer.v_proj).to(torch.float32)
+            
+            # Attention with KV cache
+            q_grouped = _group_query_heads(
+                q,
+                num_key_value_heads=self.config.num_key_value_heads,
+                kv_repeat=self.lb_model.kv_repeat,
+                head_dim=self.lb_model.head_dim,
+            )
+            keys, values = _cache_write_grouped(
+                layer_cache, k, v,
+                position=self._cache_pos,
+                num_key_value_heads=self.config.num_key_value_heads,
+                head_dim=self.lb_model.head_dim,
+            )
+            attn_out = _grouped_attention_context(
+                q_grouped, keys, values,
+                attn_scale=self.lb_model.attn_scale,
+            )
+            
+            x = residual + lb_linear_fn(attn_out, layer.o_proj).to(torch.float32)
+            
+            # MLP
+            residual = x
+            mlp_in = _cpp_rms_norm(x, layer.post_attention_layernorm_weight, eps)
+            gate = lb_linear_fn(mlp_in, layer.gate_proj).to(torch.float32)
+            up = lb_linear_fn(mlp_in, layer.up_proj).to(torch.float32)
+            
+            # Fused SiLU * up (C++ op)
+            mlp_hidden = _cpp_silu_mul(gate, up)
+            x = residual + lb_linear_fn(mlp_hidden, layer.down_proj).to(torch.float32)
+        
+        # Final RMSNorm (C++ op)
+        final_hidden = _cpp_rms_norm(x, self.lb_model.final_norm_weight, eps)
+        
         self._cache_pos += 1
-        self._last_hidden = output.hidden
-        return output.hidden
+        self._last_hidden = final_hidden
+        return final_hidden
     
     @torch.no_grad()
     def prefill(self, input_ids: torch.Tensor):
@@ -206,7 +307,6 @@ class CPUDraftModel:
         self.prefill(input_ids)
         
         # Save cache position before generating drafts
-        # (we'll roll back after so next call can re-generate from this point)
         cache_pos_before_draft = self._cache_pos
         
         # Generate K draft tokens
@@ -215,6 +315,7 @@ class CPUDraftModel:
         last_hidden = self._last_hidden  # (1, hidden_size)
         
         for k in range(draft_length):
+            # LM head via C++ dense GEMV
             logits = self._lm_head(last_hidden)  # (1, vocab_size)
             
             if greedy:
@@ -231,9 +332,7 @@ class CPUDraftModel:
             token_id = next_token.reshape(-1)[0].item()
             last_hidden = self._forward_token(token_id)
         
-        # Roll back cache position — draft tokens are speculative,
-        # they'll be confirmed (or not) by the target model.
-        # On next call, caller will provide updated input_ids with accepted tokens.
+        # Roll back cache position — draft tokens are speculative
         self._cache_pos = cache_pos_before_draft
         self._cached_seq_len = seq_len
         
