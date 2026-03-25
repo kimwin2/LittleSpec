@@ -298,11 +298,7 @@ class CPUDraftModel:
         return _cpp_embedding(self.embed_tokens, token_ids)
     
     def _lm_head(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Project hidden state to logits via INT8 or FP32 GEMV."""
-        if self._use_int8_lm_head:
-            return torch.ops.littlebit_cpu_ops.lm_head_int8(
-                hidden.reshape(1, -1).to(torch.float32).contiguous(),
-                self._lm_head_q, self._lm_head_scales)
+        """Project hidden state to logits via C++ dense GEMV."""
         return _cpp_lm_head(hidden, self.lm_head_weight)
     
     def _ensure_cache(self):
