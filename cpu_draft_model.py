@@ -266,6 +266,20 @@ class CPUDraftModel:
             logger.info(f"Full forward prep done in {time.perf_counter() - t0:.2f}s "
                         f"({len(self._layer_tensors)} tensors, {len(self._layer_dims)} dims)")
         
+        # INT8 quantize lm_head
+        self._use_int8_lm_head = False
+        self._lm_head_q = None
+        self._lm_head_scales = None
+        if _has_cpp_op("quantize_lm_head") and _has_cpp_op("lm_head_int8"):
+            logger.info("Quantizing lm_head to INT8...")
+            import time
+            t0 = time.perf_counter()
+            self._lm_head_q, self._lm_head_scales = torch.ops.littlebit_cpu_ops.quantize_lm_head(
+                self.lm_head_weight)
+            self._use_int8_lm_head = True
+            logger.info(f"lm_head INT8 quantized in {time.perf_counter() - t0:.2f}s "
+                        f"({self._lm_head_q.shape}, {self._lm_head_q.dtype})")
+        
         logger.info("CPU draft model ready")
     
     def reset(self):
@@ -280,7 +294,11 @@ class CPUDraftModel:
         return _cpp_embedding(self.embed_tokens, token_ids)
     
     def _lm_head(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Project hidden state to logits via C++ dense GEMV."""
+        """Project hidden state to logits via INT8 or FP32 GEMV."""
+        if self._use_int8_lm_head:
+            return torch.ops.littlebit_cpu_ops.lm_head_int8(
+                hidden.reshape(1, -1).to(torch.float32).contiguous(),
+                self._lm_head_q, self._lm_head_scales)
         return _cpp_lm_head(hidden, self.lm_head_weight)
     
     def _ensure_cache(self):
