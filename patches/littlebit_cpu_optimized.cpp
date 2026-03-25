@@ -1592,10 +1592,19 @@ at::Tensor full_forward_cpu(
 
     // One-time diagnostic: log thread count
     static std::once_flag diag_flag;
+    static bool do_profile = true;  // profile first call only
     std::call_once(diag_flag, [&]() {
         fprintf(stderr, "[littlebit_cpu] full_forward: at::get_num_threads()=%d\n",
                 static_cast<int>(at::get_num_threads()));
     });
+
+    // Profiling accumulators (first call only)
+    double t_vstage = 0, t_ustage = 0, t_attn = 0, t_rms = 0, t_silu = 0, t_resid = 0;
+    auto now = []() { 
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return ts.tv_sec + ts.tv_nsec * 1e-9;
+    };
 
     // Embedding: buf0 = embed_weight[token_id]
     float * x_ptr = scratch.buf0.data();
@@ -1614,15 +1623,15 @@ at::Tensor full_forward_cpu(
         const float * ln2_w = layer_tensors[tbase + 1].data_ptr<float>();
 
         // ** OPTIMIZED: pointer swap instead of memcpy for residual **
-        // residual = x (swap pointers, zero-copy)
         std::swap(x_ptr, res_ptr);
-        // Now res_ptr holds old x (= residual), x_ptr is free for reuse
 
-        // RMSNorm (reads from res_ptr which is the old x)
+        // RMSNorm
+        double t0 = do_profile ? now() : 0;
         rms_norm_inline(res_ptr, ln1_w, eps, hidden_size, scratch.normed.data());
+        if (do_profile) t_rms += now() - t0;
 
-        // 7 projections: q=0, k=1, v=2, o=3, gate=4, up=5, down=6
-        auto do_proj = [&](int64_t p, const float * input_data, float * out_data) {
+        // 7 projections with split V/U timing
+        auto do_proj_profiled = [&](int64_t p, const float * input_data, float * out_data) {
             const int64_t to = tbase + 2 + p * 5;
             const int64_t do_ = dbase + p * 4;
 
@@ -1639,33 +1648,66 @@ at::Tensor full_forward_cpu(
             const int64_t u_i2_stride = layer_tensors[to + 3].size(1);
             const float * u1 = layer_tensors[to + 4].data_ptr<float>();
 
-            lb_linear_i2_inline(
-                input_data, v_cols, v2,
-                v_i2, v_i2_stride, mid_p, rank,
-                u_i2, u_i2_stride, u1, out_f, u_cols,
-                out_data,
-                scratch.q1_buf.data(), scratch.stage1_buf.data(), scratch.q2_buf.data());
+            // V-stage timing
+            double tv0 = do_profile ? now() : 0;
+
+            // V-stage: quantize(input * v2) × v_sign_i2 → stage1 × mid
+            const float scale1 = quantize_mul_row_to_int8(
+                input_data, v2, v_cols, scratch.q1_buf.data());
+            const float inv_scale1 = 1.0f / scale1;
+#ifdef __AVX2__
+            const int32_t sum_all_q1 = sum_int8_row_avx2(scratch.q1_buf.data(), v_cols);
+            for (int64_t r = 0; r < rank; ++r) {
+                const int32_t acc = dot_int8_x_i2_row_avx2(
+                    scratch.q1_buf.data(),
+                    v_i2 + r * v_i2_stride, v_cols, sum_all_q1);
+                scratch.stage1_buf.data()[r] = static_cast<float>(acc) * inv_scale1 * mid_p[r];
+            }
+#endif
+            if (do_profile) t_vstage += now() - tv0;
+
+            // U-stage timing
+            double tu0 = do_profile ? now() : 0;
+
+            const float scale2 = quantize_row_to_int8(
+                scratch.stage1_buf.data(), rank, scratch.q2_buf.data());
+            const float inv_scale2 = 1.0f / scale2;
+#ifdef __AVX2__
+            const int32_t sum_all_q2 = sum_int8_row_avx2(scratch.q2_buf.data(), rank);
+            at::parallel_for(0, out_f, 1, [&](int64_t begin, int64_t end) {
+                for (int64_t o = begin; o < end; ++o) {
+                    const int32_t acc = dot_int8_x_i2_row_avx2(
+                        scratch.q2_buf.data(),
+                        u_i2 + o * u_i2_stride, u_cols, sum_all_q2);
+                    out_data[o] = static_cast<float>(acc) * inv_scale2 * u1[o];
+                }
+            });
+#endif
+            if (do_profile) t_ustage += now() - tu0;
         };
 
         // Q, K, V projections
-        do_proj(0, scratch.normed.data(), scratch.q_out.data());
-        do_proj(1, scratch.normed.data(), scratch.k_out.data());
-        do_proj(2, scratch.normed.data(), scratch.v_out.data());
+        do_proj_profiled(0, scratch.normed.data(), scratch.q_out.data());
+        do_proj_profiled(1, scratch.normed.data(), scratch.k_out.data());
+        do_proj_profiled(2, scratch.normed.data(), scratch.v_out.data());
 
         // Fused attention
         float * k_cache = kv_caches[layer * 2 + 0].data_ptr<float>();
         float * v_cache = kv_caches[layer * 2 + 1].data_ptr<float>();
 
+        t0 = do_profile ? now() : 0;
         fused_attention_inline(
             scratch.q_out.data(), scratch.k_out.data(), scratch.v_out.data(),
             k_cache, v_cache,
             position, num_kv_heads, kv_repeat, head_dim,
             max_seq_len, scale, scratch.attn_out.data());
+        if (do_profile) t_attn += now() - t0;
 
-        // O projection: attn_out → o_out
-        do_proj(3, scratch.attn_out.data(), scratch.o_out.data());
+        // O projection
+        do_proj_profiled(3, scratch.attn_out.data(), scratch.o_out.data());
 
-        // Residual add: x = residual + o_out
+        // Residual add
+        t0 = do_profile ? now() : 0;
 #ifdef __AVX2__
         for (int64_t i = 0; i + 8 <= hidden_size; i += 8) {
             _mm256_storeu_ps(x_ptr + i,
@@ -1678,27 +1720,32 @@ at::Tensor full_forward_cpu(
         for (int64_t i = 0; i < hidden_size; ++i)
             x_ptr[i] = res_ptr[i] + scratch.o_out[i];
 #endif
+        if (do_profile) t_resid += now() - t0;
 
-        // MLP: swap for second residual (x_ptr has attn_residual result)
+        // MLP: swap for second residual
         std::swap(x_ptr, res_ptr);
-        // res_ptr = post-attn x, x_ptr = free
 
         // Post-attention RMSNorm
+        t0 = do_profile ? now() : 0;
         rms_norm_inline(res_ptr, ln2_w, eps, hidden_size, scratch.normed.data());
+        if (do_profile) t_rms += now() - t0;
 
         // Gate and Up projections
-        do_proj(4, scratch.normed.data(), scratch.gate_out.data());
-        do_proj(5, scratch.normed.data(), scratch.up_out.data());
+        do_proj_profiled(4, scratch.normed.data(), scratch.gate_out.data());
+        do_proj_profiled(5, scratch.normed.data(), scratch.up_out.data());
 
         // SiLU-mul
-        const int64_t intermediate_size = layer_dims[dbase + 4 * 4 + 3]; // gate out_features
+        const int64_t intermediate_size = layer_dims[dbase + 4 * 4 + 3];
+        t0 = do_profile ? now() : 0;
         silu_mul_inline(scratch.gate_out.data(), scratch.up_out.data(),
                         intermediate_size, scratch.mlp_hidden.data());
+        if (do_profile) t_silu += now() - t0;
 
         // Down projection
-        do_proj(6, scratch.mlp_hidden.data(), scratch.down_out.data());
+        do_proj_profiled(6, scratch.mlp_hidden.data(), scratch.down_out.data());
 
-        // Residual add: x = residual + down_out
+        // Residual add
+        t0 = do_profile ? now() : 0;
 #ifdef __AVX2__
         for (int64_t i = 0; i + 8 <= hidden_size; i += 8) {
             _mm256_storeu_ps(x_ptr + i,
@@ -1711,6 +1758,22 @@ at::Tensor full_forward_cpu(
         for (int64_t i = 0; i < hidden_size; ++i)
             x_ptr[i] = res_ptr[i] + scratch.down_out[i];
 #endif
+        if (do_profile) t_resid += now() - t0;
+    }
+
+    // Print profile on first call
+    if (do_profile) {
+        do_profile = false;
+        double total = t_vstage + t_ustage + t_attn + t_rms + t_silu + t_resid;
+        fprintf(stderr,
+            "[littlebit_cpu] PROFILE (32 layers): total=%.1fms\n"
+            "  V-stage=%.1fms (%.0f%%)  U-stage=%.1fms (%.0f%%)\n"
+            "  Attn=%.1fms (%.0f%%)  RMS=%.1fms  SiLU=%.1fms  Resid=%.1fms\n",
+            total * 1000,
+            t_vstage * 1000, t_vstage / total * 100,
+            t_ustage * 1000, t_ustage / total * 100,
+            t_attn * 1000, t_attn / total * 100,
+            t_rms * 1000, t_silu * 1000, t_resid * 1000);
     }
 
     // Final RMSNorm — output directly to result tensor
