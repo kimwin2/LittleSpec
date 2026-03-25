@@ -210,7 +210,7 @@ class CPUDraftModel:
         self._last_hidden = None   # Last hidden state from transformer
 
         # Log C++ op availability
-        cpp_ops = ["full_forward", "quantize_lm_head", "lm_head_int8",
+        cpp_ops = ["generate_token", "quantize_lm_head_q4", "full_forward",
                     "repack_signs_to_i2", "embedding_lookup", "rms_norm"]
         avail = [name for name in cpp_ops if _has_cpp_op(name)]
         logger.info(f"C++ ops available: {avail if avail else 'none (using Python fallback)'}")
@@ -266,19 +266,23 @@ class CPUDraftModel:
             logger.info(f"Full forward prep done in {time.perf_counter() - t0:.2f}s "
                         f"({len(self._layer_tensors)} tensors, {len(self._layer_dims)} dims)")
         
-        # INT8 quantize lm_head
-        self._use_int8_lm_head = False
-        self._lm_head_q = None
-        self._lm_head_scales = None
-        if _has_cpp_op("quantize_lm_head") and _has_cpp_op("lm_head_int8"):
-            logger.info("Quantizing lm_head to INT8...")
+        # Q4 quantize lm_head for generate_token_cpu
+        self._use_generate_token = False
+        self._lm_head_q4 = None
+        self._vocab_size = 0
+        if (_has_cpp_op("generate_token") and _has_cpp_op("quantize_lm_head_q4")
+            and self._use_full_forward):
+            logger.info("Quantizing lm_head to Q4_0...")
             import time
             t0 = time.perf_counter()
-            self._lm_head_q, self._lm_head_scales = torch.ops.littlebit_cpu_ops.quantize_lm_head(
+            self._lm_head_q4 = torch.ops.littlebit_cpu_ops.quantize_lm_head_q4(
                 self.lm_head_weight)
-            self._use_int8_lm_head = True
-            logger.info(f"lm_head INT8 quantized in {time.perf_counter() - t0:.2f}s "
-                        f"({self._lm_head_q.shape}, {self._lm_head_q.dtype})")
+            self._vocab_size = self.lm_head_weight.shape[0]
+            self._use_generate_token = True
+            q4_mb = self._lm_head_q4.numel() / (1024 * 1024)
+            orig_mb = self.lm_head_weight.numel() * 4 / (1024 * 1024)
+            logger.info(f"lm_head Q4 quantized in {time.perf_counter() - t0:.2f}s "
+                        f"({orig_mb:.0f}MB -> {q4_mb:.0f}MB, {orig_mb/q4_mb:.1f}x compression)")
         
         logger.info("CPU draft model ready")
     
@@ -490,25 +494,76 @@ class CPUDraftModel:
         # Generate K draft tokens
         draft_tokens = []
         draft_probs = []
-        last_hidden = self._last_hidden  # (1, hidden_size)
         
-        for k in range(draft_length):
-            # LM head via C++ dense GEMV
-            logits = self._lm_head(last_hidden)  # (1, vocab_size)
+        if self._use_generate_token:
+            # ===== PURE C++ PATH =====
+            # Each call: full_forward + Q4 lm_head + argmax in ONE C++ call
+            last_token_id = input_ids[0, -1].item() if self._last_hidden is None else None
             
-            if greedy:
-                probs = F.softmax(logits / max(temperature, 1e-8), dim=-1)
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)  # (1, 1)
-            else:
-                probs = F.softmax(logits / max(temperature, 1e-8), dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
+            for k in range(draft_length):
+                if k == 0 and self._last_hidden is not None:
+                    # First draft: we already have last_hidden from prefill
+                    # Need lm_head + argmax for first token, then generate_token for rest
+                    logits = self._lm_head(self._last_hidden)
+                    if greedy:
+                        probs = F.softmax(logits / max(temperature, 1e-8), dim=-1)
+                        next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                    else:
+                        probs = F.softmax(logits / max(temperature, 1e-8), dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                    draft_tokens.append(next_token)
+                    draft_probs.append(probs.unsqueeze(0))
+                    token_id = next_token.reshape(-1)[0].item()
+                else:
+                    if k == 0:
+                        token_id = last_token_id
+                    # Pure C++ generate: forward + Q4 lm_head + argmax
+                    token_id = torch.ops.littlebit_cpu_ops.generate_token(
+                        token_id,
+                        self.embed_tokens,
+                        self.lb_model.final_norm_weight.contiguous(),
+                        self._layer_tensors,
+                        self._kv_cache_tensors,
+                        self._layer_dims,
+                        self._lm_head_q4,
+                        self._vocab_size,
+                        self.config.num_hidden_layers,
+                        self.config.hidden_size,
+                        self.config.num_key_value_heads,
+                        self.lb_model.kv_repeat,
+                        self.lb_model.head_dim,
+                        self.max_seq_len,
+                        self._cache_pos,
+                        self.lb_model.attn_scale,
+                        self.config.rms_norm_eps,
+                    )
+                    self._cache_pos += 1
+                    next_token = torch.tensor([[token_id]], dtype=torch.long)
+                    # For pure C++ path, we don't have logits/probs
+                    # Create dummy uniform probs (speculative decoding will use target logits)
+                    draft_tokens.append(next_token)
+                    dummy_probs = torch.zeros(1, self._vocab_size)
+                    dummy_probs[0, token_id] = 1.0
+                    draft_probs.append(dummy_probs.unsqueeze(0))
+        else:
+            # ===== FALLBACK PYTHON PATH =====
+            last_hidden = self._last_hidden  # (1, hidden_size)
             
-            draft_tokens.append(next_token)
-            draft_probs.append(probs.unsqueeze(0))
-            
-            # Forward next token through transformer (updates cache)
-            token_id = next_token.reshape(-1)[0].item()
-            last_hidden = self._forward_token(token_id)
+            for k in range(draft_length):
+                logits = self._lm_head(last_hidden)
+                
+                if greedy:
+                    probs = F.softmax(logits / max(temperature, 1e-8), dim=-1)
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                else:
+                    probs = F.softmax(logits / max(temperature, 1e-8), dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                
+                draft_tokens.append(next_token)
+                draft_probs.append(probs.unsqueeze(0))
+                
+                token_id = next_token.reshape(-1)[0].item()
+                last_hidden = self._forward_token(token_id)
         
         # Roll back cache position — draft tokens are speculative
         self._cache_pos = cache_pos_before_draft

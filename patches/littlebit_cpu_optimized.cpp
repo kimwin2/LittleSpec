@@ -1682,90 +1682,242 @@ at::Tensor full_forward_cpu(
 }
 
 // ============================================================================
-// INT8 quantized lm_head
+// Q4_0 quantized lm_head (llama.cpp compatible format)
 // ============================================================================
 
-// Quantize lm_head weight from FP32 to INT8 (per-row)
-// Returns: (int8_weight [vocab, hidden], scales [vocab])
-std::tuple<at::Tensor, at::Tensor> quantize_lm_head_cpu(const at::Tensor & weight) {
+// Q4_0 block: 32 values, 1 fp16 scale + 16 nibble bytes = 18 bytes/block
+#pragma pack(push, 1)
+struct block_q4_0 {
+    uint16_t d;           // fp16 delta (scale)
+    uint8_t qs[16];       // 32 x 4-bit nibbles packed in pairs
+};
+struct block_q8_0 {
+    uint16_t d;           // fp16 delta (scale)
+    int8_t qs[32];        // 32 x int8
+};
+#pragma pack(pop)
+
+static constexpr int QK4_0 = 32;
+static constexpr int QK8_0 = 32;
+
+// FP16 <-> FP32 conversion helpers
+static inline float fp16_to_fp32(uint16_t h) {
+    // Use compiler/hardware conversion if available
+    uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t expo = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    if (expo == 0) {
+        if (mant == 0) { float r; uint32_t v = sign; std::memcpy(&r, &v, 4); return r; }
+        // subnormal
+        while (!(mant & 0x400)) { mant <<= 1; expo--; }
+        expo++; mant &= ~0x400;
+    } else if (expo == 31) {
+        uint32_t v = sign | 0x7F800000u | (mant << 13);
+        float r; std::memcpy(&r, &v, 4); return r;
+    }
+    uint32_t v = sign | ((expo + 112) << 23) | (mant << 13);
+    float r; std::memcpy(&r, &v, 4); return r;
+}
+
+static inline uint16_t fp32_to_fp16(float f) {
+    uint32_t v; std::memcpy(&v, &f, 4);
+    uint32_t sign = (v >> 16) & 0x8000;
+    int32_t expo = ((v >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (v >> 13) & 0x3FF;
+    if (expo <= 0) return static_cast<uint16_t>(sign);
+    if (expo >= 31) return static_cast<uint16_t>(sign | 0x7C00);
+    return static_cast<uint16_t>(sign | (expo << 10) | mant);
+}
+
+// Quantize a single row of FP32 to Q4_0 blocks
+static void quantize_row_fp32_to_q4_0(const float * x, block_q4_0 * y, int64_t k) {
+    const int64_t nb = k / QK4_0;
+    for (int64_t i = 0; i < nb; ++i) {
+        float amax = 0.0f, max_val = 0.0f;
+        for (int j = 0; j < QK4_0; ++j) {
+            if (std::fabs(x[i * QK4_0 + j]) > amax) {
+                amax = std::fabs(x[i * QK4_0 + j]);
+                max_val = x[i * QK4_0 + j];
+            }
+        }
+        const float d = max_val / -8.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = fp32_to_fp16(d);
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            const float x0 = x[i * QK4_0 + j] * id;
+            const float x1 = x[i * QK4_0 + QK4_0 / 2 + j] * id;
+            const uint8_t xi0 = std::min(15, static_cast<int>(x0 + 8.5f));
+            const uint8_t xi1 = std::min(15, static_cast<int>(x1 + 8.5f));
+            y[i].qs[j] = xi0 | (xi1 << 4);
+        }
+    }
+}
+
+// Quantize a single row of FP32 to Q8_0 blocks
+static void quantize_row_fp32_to_q8_0(const float * x, block_q8_0 * y, int64_t k) {
+    const int64_t nb = k / QK8_0;
+    for (int64_t i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; ++j)
+            amax = std::max(amax, std::fabs(x[i * QK8_0 + j]));
+        const float d = amax / 127.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = fp32_to_fp16(d);
+        for (int j = 0; j < QK8_0; ++j)
+            y[i].qs[j] = static_cast<int8_t>(std::roundf(x[i * QK8_0 + j] * id));
+    }
+}
+
+// Q4_0 x Q8_0 dot product for one row (llama.cpp AVX2 pattern)
+static float vec_dot_q4_0_q8_0(const block_q4_0 * x, const block_q8_0 * y, int64_t nb) {
+    float sumf = 0.0f;
+#ifdef __AVX2__
+    __m256 acc = _mm256_setzero_ps();
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+        const __m256 d_v = _mm256_set1_ps(d);
+
+        // Unpack Q4 nibbles to bytes: load 16 bytes -> 32 values in [0,15]
+        const __m128i q4bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(x[i].qs));
+        const __m256i q4_lo = _mm256_and_si256(
+            _mm256_insertf128_si256(_mm256_castsi128_si256(q4bits), q4bits, 1),
+            _mm256_set1_epi8(0x0F));
+        const __m256i q4_hi = _mm256_and_si256(
+            _mm256_insertf128_si256(
+                _mm256_castsi128_si256(_mm_srli_epi16(q4bits, 4)),
+                _mm_srli_epi16(q4bits, 4), 1),
+            _mm256_set1_epi8(0x0F));
+        // Interleave: low nibbles in low 128, high nibbles in high 128
+        const __m256i qx = _mm256_permute2x128_si256(q4_lo, q4_hi, 0x20);
+        // Offset into [-8, +7]
+        const __m256i off = _mm256_set1_epi8(8);
+        const __m256i qx_signed = _mm256_sub_epi8(qx, off);
+
+        // Load Q8 values
+        const __m256i qy = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y[i].qs));
+
+        // Dot product: need signed*signed handling via maddubs
+        // maddubs requires first operand unsigned. Use abs(qy) and sign(qx, qy) trick
+        const __m256i abs_qy = _mm256_abs_epi8(qy);
+        const __m256i sign_qx = _mm256_sign_epi8(qx_signed, qy);
+        const __m256i prod16 = _mm256_maddubs_epi16(abs_qy, sign_qx);
+        const __m256i ones16 = _mm256_set1_epi16(1);
+        const __m256i prod32 = _mm256_madd_epi16(prod16, ones16);
+        acc = _mm256_fmadd_ps(d_v, _mm256_cvtepi32_ps(prod32), acc);
+    }
+    // horizontal sum
+    const __m128 r4 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    const __m128 r2 = _mm_add_ps(r4, _mm_movehl_ps(r4, r4));
+    const __m128 r1 = _mm_add_ss(r2, _mm_shuffle_ps(r2, r2, 1));
+    sumf = _mm_cvtss_f32(r1);
+#else
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+        int32_t sumi = 0;
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            const int v0 = (x[i].qs[j] & 0x0F) - 8;
+            const int v1 = (x[i].qs[j] >> 4) - 8;
+            sumi += v0 * y[i].qs[j] + v1 * y[i].qs[j + QK4_0 / 2];
+        }
+        sumf += d * static_cast<float>(sumi);
+    }
+#endif
+    return sumf;
+}
+
+// Quantize lm_head weight from FP32 to Q4_0 packed tensor
+// Returns: (q4_packed [packed_bytes], original_shape_info_unused)
+at::Tensor quantize_lm_head_q4_cpu(const at::Tensor & weight) {
     check_float32_tensor(weight, "weight");
     const int64_t vocab = weight.size(0);
     const int64_t hidden = weight.size(1);
+    TORCH_CHECK(hidden % QK4_0 == 0, "hidden_size must be multiple of 32");
 
-    auto q_weight = at::empty({vocab, hidden}, weight.options().dtype(at::kChar));
-    auto scales = at::empty({vocab}, weight.options().dtype(at::kFloat));
+    const int64_t blocks_per_row = hidden / QK4_0;
+    const int64_t bytes_per_row = blocks_per_row * sizeof(block_q4_0);
+    const int64_t total_bytes = vocab * bytes_per_row;
 
+    // Store as raw byte tensor
+    auto q_packed = at::empty({total_bytes}, weight.options().dtype(at::kByte));
     const float * w_ptr = weight.data_ptr<float>();
-    int8_t * q_ptr = q_weight.data_ptr<int8_t>();
-    float * s_ptr = scales.data_ptr<float>();
+    uint8_t * q_ptr = q_packed.data_ptr<uint8_t>();
 
     at::parallel_for(0, vocab, 0, [&](int64_t begin, int64_t end) {
         for (int64_t row = begin; row < end; ++row) {
-            s_ptr[row] = quantize_row_to_int8(w_ptr + row * hidden, hidden, q_ptr + row * hidden);
+            quantize_row_fp32_to_q4_0(
+                w_ptr + row * hidden,
+                reinterpret_cast<block_q4_0 *>(q_ptr + row * bytes_per_row),
+                hidden);
         }
     });
 
-    return std::make_tuple(q_weight, scales);
+    return q_packed;
 }
 
-// INT8 lm_head: int8_input × int8_weight^T with per-row scales
-at::Tensor lm_head_int8_cpu(
-    const at::Tensor & hidden_state,  // [1, hidden_size] float32
-    const at::Tensor & q_weight,      // [vocab, hidden_size] int8
-    const at::Tensor & weight_scales  // [vocab] float32
+// generate_token_cpu: full_forward + Q4 lm_head + argmax in ONE C++ call
+// Returns: token_id as scalar tensor
+int64_t generate_token_cpu(
+    int64_t token_id,
+    const at::Tensor & embed_weight,
+    const at::Tensor & final_norm_weight,
+    at::TensorList layer_tensors,
+    at::TensorList kv_caches,
+    at::IntArrayRef layer_dims,
+    const at::Tensor & lm_head_q4,    // Q4_0 packed weight bytes
+    int64_t vocab_size,
+    int64_t num_layers,
+    int64_t hidden_size,
+    int64_t num_kv_heads,
+    int64_t kv_repeat,
+    int64_t head_dim,
+    int64_t max_seq_len,
+    int64_t position,
+    double attn_scale,
+    double rms_eps
 ) {
-    check_float32_tensor(hidden_state, "hidden_state");
-    check_cpu_tensor(q_weight, "q_weight");
-    check_float32_tensor(weight_scales, "weight_scales");
+    // ===== Step 1: full_forward (reuse existing logic) =====
+    at::Tensor hidden = full_forward_cpu(
+        token_id, embed_weight, final_norm_weight,
+        layer_tensors, kv_caches, layer_dims,
+        num_layers, hidden_size, num_kv_heads, kv_repeat,
+        head_dim, max_seq_len, position, attn_scale, rms_eps);
 
-    const int64_t hidden = hidden_state.size(1);
-    const int64_t vocab = q_weight.size(0);
+    const float * hidden_ptr = hidden.data_ptr<float>();
 
-    // Quantize input to int8
-    thread_local std::vector<int8_t> input_q;
-    input_q.resize(hidden);
-    const float input_scale = quantize_row_to_int8(
-        hidden_state.data_ptr<float>(), hidden, input_q.data());
-    const float inv_input_scale = 1.0f / input_scale;
+    // ===== Step 2: Q4 lm_head GEMV =====
+    TORCH_CHECK(hidden_size % QK4_0 == 0, "hidden_size must be multiple of 32");
+    const int64_t blocks_per_row = hidden_size / QK4_0;
+    const int64_t bytes_per_row = blocks_per_row * sizeof(block_q4_0);
+    const uint8_t * q4_ptr = lm_head_q4.data_ptr<uint8_t>();
 
-    auto output = at::empty({1, vocab}, hidden_state.options());
-    float * out_ptr = output.data_ptr<float>();
-    const int8_t * q_ptr = q_weight.data_ptr<int8_t>();
-    const float * s_ptr = weight_scales.data_ptr<float>();
+    // Quantize hidden state to Q8_0
+    thread_local std::vector<block_q8_0> input_q8;
+    input_q8.resize(blocks_per_row);
+    quantize_row_fp32_to_q8_0(hidden_ptr, input_q8.data(), hidden_size);
 
-    at::parallel_for(0, vocab, 0, [&](int64_t begin, int64_t end) {
+    // Parallel GEMV across vocab rows
+    thread_local std::vector<float> logits_buf;
+    logits_buf.resize(vocab_size);
+
+    at::parallel_for(0, vocab_size, 0, [&](int64_t begin, int64_t end) {
         for (int64_t row = begin; row < end; ++row) {
-            const int8_t * w_row = q_ptr + row * hidden;
-            int32_t dot = 0;
-#ifdef __AVX2__
-            __m256i acc = _mm256_setzero_si256();
-            int64_t i = 0;
-            for (; i + 32 <= hidden; i += 32) {
-                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input_q.data() + i));
-                const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w_row + i));
-                // sign_epi8(a, b) flips sign of a where b is negative
-                // Then maddubs + madd for accumulation
-                const __m256i abs_a = _mm256_abs_epi8(a);
-                const __m256i sign_b = _mm256_sign_epi8(b, b); // abs(b) where b positive, but we need different approach
-                // Actually for int8 × int8 dot product:
-                // Use _mm256_maddubs_epi16(abs(a), sign(a)*b) pattern
-                const __m256i a_sign = _mm256_sign_epi8(b, a); // b * sign(a)
-                const __m256i abs_a2 = _mm256_abs_epi8(a);
-                const __m256i prod16 = _mm256_maddubs_epi16(abs_a2, a_sign);
-                const __m256i ones16 = _mm256_set1_epi16(1);
-                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod16, ones16));
-            }
-            dot = hsum_epi32(acc);
-            for (; i < hidden; ++i) dot += static_cast<int32_t>(input_q[i]) * static_cast<int32_t>(w_row[i]);
-#else
-            for (int64_t i = 0; i < hidden; ++i)
-                dot += static_cast<int32_t>(input_q[i]) * static_cast<int32_t>(w_row[i]);
-#endif
-            out_ptr[row] = static_cast<float>(dot) * inv_input_scale / s_ptr[row];
+            const block_q4_0 * w_row = reinterpret_cast<const block_q4_0 *>(
+                q4_ptr + row * bytes_per_row);
+            logits_buf[row] = vec_dot_q4_0_q8_0(w_row, input_q8.data(), blocks_per_row);
         }
     });
 
-    return output;
+    // ===== Step 3: argmax =====
+    int64_t best_id = 0;
+    float best_val = logits_buf[0];
+    for (int64_t i = 1; i < vocab_size; ++i) {
+        if (logits_buf[i] > best_val) {
+            best_val = logits_buf[i];
+            best_id = i;
+        }
+    }
+
+    return best_id;
 }
 
 }  // namespace littlebit_cpu_ops
@@ -1807,11 +1959,16 @@ TORCH_LIBRARY(littlebit_cpu_ops, m) {
         "int max_seq_len, int position, float attn_scale, float rms_eps"
         ") -> Tensor"
     );
-    m.def("quantize_lm_head(Tensor weight) -> (Tensor, Tensor)");
+    m.def("quantize_lm_head_q4(Tensor weight) -> Tensor");
     m.def(
-        "lm_head_int8("
-        "Tensor hidden_state, Tensor q_weight, Tensor weight_scales"
-        ") -> Tensor"
+        "generate_token("
+        "int token_id, Tensor embed_weight, Tensor final_norm_weight, "
+        "Tensor[] layer_tensors, Tensor[] kv_caches, "
+        "int[] layer_dims, Tensor lm_head_q4, int vocab_size, "
+        "int num_layers, int hidden_size, "
+        "int num_kv_heads, int kv_repeat, int head_dim, "
+        "int max_seq_len, int position, float attn_scale, float rms_eps"
+        ") -> int"
     );
 }
 
@@ -1827,6 +1984,6 @@ TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
     m.impl("repack_signs_to_i2", littlebit_cpu_ops::repack_signs_to_i2_cpu);
     m.impl("littlebit_linear_i2", littlebit_cpu_ops::littlebit_linear_i2_cpu);
     m.impl("full_forward", littlebit_cpu_ops::full_forward_cpu);
-    m.impl("quantize_lm_head", littlebit_cpu_ops::quantize_lm_head_cpu);
-    m.impl("lm_head_int8", littlebit_cpu_ops::lm_head_int8_cpu);
+    m.impl("quantize_lm_head_q4", littlebit_cpu_ops::quantize_lm_head_q4_cpu);
+    m.impl("generate_token", littlebit_cpu_ops::generate_token_cpu);
 }
