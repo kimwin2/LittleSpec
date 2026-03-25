@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -1453,11 +1457,10 @@ inline void fused_attention_inline(
 
     // ** OPTIMIZED: Parallelize attention across all query heads **
     const int64_t num_heads = num_kv_heads * kv_repeat;
-    at::parallel_for(0, num_heads, 1, [&](int64_t head_begin, int64_t head_end) {
+    #pragma omp parallel for schedule(static)
+    for (int64_t q_head = 0; q_head < num_heads; ++q_head) {
         // Each thread gets its own scores buffer
         std::vector<float> local_scores(seq_len);
-
-        for (int64_t q_head = head_begin; q_head < head_end; ++q_head) {
             const int64_t kv_h = q_head / kv_repeat;
             const float * k_base = k_cache + kv_h * max_seq * head_dim;
             const float * v_base = v_cache + kv_h * max_seq * head_dim;
@@ -1514,7 +1517,7 @@ inline void fused_attention_inline(
 #endif
             }
         }
-    });
+    }
 }
 
 at::Tensor full_forward_cpu(
@@ -1701,24 +1704,23 @@ at::Tensor full_forward_cpu(
             total_qkv_rows += attn_works[i].out_features;
         }
 #ifdef __AVX2__
-        at::parallel_for(0, total_qkv_rows, 1, [&](int64_t begin, int64_t end) {
-            for (int64_t flat_row = begin; flat_row < end; ++flat_row) {
-                // Find which projection this row belongs to
-                const UStageWork * w;
-                int64_t local_row;
-                if (flat_row < attn_works[0].row_offset + attn_works[0].out_features) {
-                    w = &attn_works[0]; local_row = flat_row - attn_works[0].row_offset;
-                } else if (flat_row < attn_works[1].row_offset + attn_works[1].out_features) {
-                    w = &attn_works[1]; local_row = flat_row - attn_works[1].row_offset;
-                } else {
-                    w = &attn_works[2]; local_row = flat_row - attn_works[2].row_offset;
-                }
-                const int32_t acc = dot_int8_x_i2_row_avx2(
-                    w->q2_data, w->u_i2 + local_row * w->u_i2_stride,
-                    w->u_cols, w->sum_all_q2);
-                w->output[local_row] = static_cast<float>(acc) * w->inv_scale2 * w->u1[local_row];
+        #pragma omp parallel for schedule(static)
+        for (int64_t flat_row = 0; flat_row < total_qkv_rows; ++flat_row) {
+            // Find which projection this row belongs to
+            const UStageWork * w;
+            int64_t local_row;
+            if (flat_row < attn_works[0].row_offset + attn_works[0].out_features) {
+                w = &attn_works[0]; local_row = flat_row - attn_works[0].row_offset;
+            } else if (flat_row < attn_works[1].row_offset + attn_works[1].out_features) {
+                w = &attn_works[1]; local_row = flat_row - attn_works[1].row_offset;
+            } else {
+                w = &attn_works[2]; local_row = flat_row - attn_works[2].row_offset;
             }
-        });
+            const int32_t acc = dot_int8_x_i2_row_avx2(
+                w->q2_data, w->u_i2 + local_row * w->u_i2_stride,
+                w->u_cols, w->sum_all_q2);
+            w->output[local_row] = static_cast<float>(acc) * w->inv_scale2 * w->u1[local_row];
+        }
 #endif
 
         // Fused attention
@@ -1736,14 +1738,15 @@ at::Tensor full_forward_cpu(
                   scratch.q1_buf.data(), scratch.stage1_buf.data(), scratch.q2_buf.data(),
                   attn_works[3]);
 #ifdef __AVX2__
-        at::parallel_for(0, attn_works[3].out_features, 1, [&](int64_t begin, int64_t end) {
+        {
             const auto & w = attn_works[3];
-            for (int64_t o = begin; o < end; ++o) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t o = 0; o < w.out_features; ++o) {
                 const int32_t acc = dot_int8_x_i2_row_avx2(
                     w.q2_data, w.u_i2 + o * w.u_i2_stride, w.u_cols, w.sum_all_q2);
                 w.output[o] = static_cast<float>(acc) * w.inv_scale2 * w.u1[o];
             }
-        });
+        }
 #endif
 
         // Residual add: x = residual + o_out
@@ -1779,21 +1782,20 @@ at::Tensor full_forward_cpu(
             total_mlp_rows += mlp_works[i].out_features;
         }
 #ifdef __AVX2__
-        at::parallel_for(0, total_mlp_rows, 1, [&](int64_t begin, int64_t end) {
-            for (int64_t flat_row = begin; flat_row < end; ++flat_row) {
-                const UStageWork * w;
-                int64_t local_row;
-                if (flat_row < mlp_works[0].row_offset + mlp_works[0].out_features) {
-                    w = &mlp_works[0]; local_row = flat_row - mlp_works[0].row_offset;
-                } else {
-                    w = &mlp_works[1]; local_row = flat_row - mlp_works[1].row_offset;
-                }
-                const int32_t acc = dot_int8_x_i2_row_avx2(
-                    w->q2_data, w->u_i2 + local_row * w->u_i2_stride,
-                    w->u_cols, w->sum_all_q2);
-                w->output[local_row] = static_cast<float>(acc) * w->inv_scale2 * w->u1[local_row];
+        #pragma omp parallel for schedule(static)
+        for (int64_t flat_row = 0; flat_row < total_mlp_rows; ++flat_row) {
+            const UStageWork * w;
+            int64_t local_row;
+            if (flat_row < mlp_works[0].row_offset + mlp_works[0].out_features) {
+                w = &mlp_works[0]; local_row = flat_row - mlp_works[0].row_offset;
+            } else {
+                w = &mlp_works[1]; local_row = flat_row - mlp_works[1].row_offset;
             }
-        });
+            const int32_t acc = dot_int8_x_i2_row_avx2(
+                w->q2_data, w->u_i2 + local_row * w->u_i2_stride,
+                w->u_cols, w->sum_all_q2);
+            w->output[local_row] = static_cast<float>(acc) * w->inv_scale2 * w->u1[local_row];
+        }
 #endif
 
         // SiLU-mul
@@ -1806,14 +1808,15 @@ at::Tensor full_forward_cpu(
                   scratch.q1_buf.data(), scratch.stage1_buf.data(), scratch.q2_buf.data(),
                   mlp_works[2]);
 #ifdef __AVX2__
-        at::parallel_for(0, mlp_works[2].out_features, 1, [&](int64_t begin, int64_t end) {
+        {
             const auto & w = mlp_works[2];
-            for (int64_t o = begin; o < end; ++o) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t o = 0; o < w.out_features; ++o) {
                 const int32_t acc = dot_int8_x_i2_row_avx2(
                     w.q2_data, w.u_i2 + o * w.u_i2_stride, w.u_cols, w.sum_all_q2);
                 w.output[o] = static_cast<float>(acc) * w.inv_scale2 * w.u1[o];
             }
-        });
+        }
 #endif
 
         // Residual add: x = residual + down_out
@@ -2047,22 +2050,20 @@ int64_t generate_token_cpu(
     const int64_t bytes_per_row = blocks_per_row * sizeof(block_q4_0);
     const uint8_t * q4_ptr = lm_head_q4.data_ptr<uint8_t>();
 
-    // Quantize hidden state to Q8_0
-    thread_local std::vector<block_q8_0> input_q8;
-    input_q8.resize(blocks_per_row);
+    // Quantize hidden state to Q8_0 — shared across all threads (read-only)
+    std::vector<block_q8_0> input_q8(blocks_per_row);
     quantize_row_fp32_to_q8_0(hidden_ptr, input_q8.data(), hidden_size);
 
-    // Parallel GEMV across vocab rows
-    thread_local std::vector<float> logits_buf;
-    logits_buf.resize(vocab_size);
+    // OpenMP parallel GEMV across vocab rows
+    std::vector<float> logits_buf(vocab_size);
 
-    at::parallel_for(0, vocab_size, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t row = begin; row < end; ++row) {
-            const block_q4_0 * w_row = reinterpret_cast<const block_q4_0 *>(
-                q4_ptr + row * bytes_per_row);
-            logits_buf[row] = vec_dot_q4_0_q8_0(w_row, input_q8.data(), blocks_per_row);
-        }
-    });
+    const block_q8_0 * q8_ptr = input_q8.data();
+    #pragma omp parallel for schedule(static)
+    for (int64_t row = 0; row < vocab_size; ++row) {
+        const block_q4_0 * w_row = reinterpret_cast<const block_q4_0 *>(
+            q4_ptr + row * bytes_per_row);
+        logits_buf[row] = vec_dot_q4_0_q8_0(w_row, q8_ptr, blocks_per_row);
+    }
 
     // ===== Step 3: argmax =====
     int64_t best_id = 0;

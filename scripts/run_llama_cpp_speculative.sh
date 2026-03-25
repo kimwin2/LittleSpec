@@ -110,16 +110,12 @@ fi
 # Build CPU extension with optimized kernel
 echo "Building CPU extension (optimized kernel)..."
 
-# Copy optimized kernel over the original (lb_kernels is a submodule, can't push there)
+# Copy optimized kernel and clean build so _ensure_new_ops recompiles with -fopenmp
 if [ -f "patches/littlebit_cpu_optimized.cpp" ]; then
     echo "Applying optimized kernel from patches/..."
     cp patches/littlebit_cpu_optimized.cpp lb_kernels/littlebit_kernels_cpu/littlebit_cpu.cpp
 fi
-
-cd lb_kernels/littlebit_kernels_cpu
-rm -rf build/       # Force rebuild
-python setup.py build_ext --inplace
-cd ../..
+rm -rf lb_kernels/littlebit_kernels_cpu/build/
 
 # ===========================
 # STEP 4: FP16 Target Baseline (llama.cpp)
