@@ -1110,6 +1110,22 @@ at::Tensor dense_gemv_f32_cpu(
     return output;
 }
 
+// Fast exp approximation (Schraudolph's method) for AVX2
+// exp(x) ≈ reinterpret(int(x * 2^23/ln2 + 127*2^23))
+// Accurate to ~0.1% for |x| < 88
+#ifdef __AVX2__
+static const __m256 k_exp_a = _mm256_set1_ps(12102203.0f);  // 2^23 / ln(2)
+static const __m256 k_exp_b = _mm256_set1_ps(1065353216.0f); // 127 * 2^23
+static const __m256 k_exp_clamp_lo = _mm256_set1_ps(-88.0f);
+static const __m256 k_exp_clamp_hi = _mm256_set1_ps(88.0f);
+
+inline __m256 fast_exp_avx2(__m256 x) {
+    x = _mm256_max_ps(k_exp_clamp_lo, _mm256_min_ps(k_exp_clamp_hi, x));
+    __m256i fi = _mm256_cvtps_epi32(_mm256_add_ps(k_exp_b, _mm256_mul_ps(k_exp_a, x)));
+    return _mm256_castsi256_ps(fi);
+}
+#endif
+
 at::Tensor silu_mul_cpu(
     const at::Tensor & gate,
     const at::Tensor & up) {
@@ -1126,25 +1142,15 @@ at::Tensor silu_mul_cpu(
 
 #ifdef __AVX2__
     const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 neg_one = _mm256_set1_ps(-1.0f);
     int64_t i = 0;
     for (; i + 8 <= numel; i += 8) {
         const __m256 g = _mm256_loadu_ps(g_ptr + i);
         const __m256 u = _mm256_loadu_ps(u_ptr + i);
-        // sigmoid(x) ≈ 1 / (1 + exp(-x))
-        // Compute exp(-x) via fast approximation
-        // Use the identity: sigmoid(x) = 0.5 * (1 + tanh(x/2))
-        // But for accuracy, use scalar exp. For speed, process vectorized.
-        // Fall back to scalar for now — the main savings is avoiding Python dispatch.
-        alignas(32) float gv[8], uv[8];
-        _mm256_storeu_ps(gv, g);
-        _mm256_storeu_ps(uv, u);
-        alignas(32) float rv[8];
-        for (int j = 0; j < 8; ++j) {
-            const float sig = 1.0f / (1.0f + std::exp(-gv[j]));
-            rv[j] = gv[j] * sig * uv[j];
-        }
-        _mm256_storeu_ps(out_ptr + i, _mm256_loadu_ps(rv));
+        // sigmoid(g) = 1 / (1 + exp(-g))  using fast_exp
+        __m256 neg_g = _mm256_sub_ps(_mm256_setzero_ps(), g);
+        __m256 exp_neg = fast_exp_avx2(neg_g);
+        __m256 sigmoid = _mm256_div_ps(one, _mm256_add_ps(one, exp_neg));
+        _mm256_storeu_ps(out_ptr + i, _mm256_mul_ps(_mm256_mul_ps(g, sigmoid), u));
     }
     for (; i < numel; ++i) {
         const float sig = 1.0f / (1.0f + std::exp(-g_ptr[i]));
@@ -1341,16 +1347,19 @@ inline void lb_linear_i2_inline(
 #endif
 
     // Stage 2: quantize(stage1) × u_sign_i2 → output × u1
+    // ** OPTIMIZED: parallel_for over output features (gate/up have 14336 rows) **
     const float scale2 = quantize_row_to_int8(stage1_buf, rank, q2_buf);
     const float inv_scale2 = 1.0f / scale2;
 
 #ifdef __AVX2__
     const int32_t sum_all_q2 = sum_int8_row_avx2(q2_buf, rank);
-    for (int64_t o = 0; o < out_features; ++o) {
-        const int32_t acc = dot_int8_x_i2_row_avx2(
-            q2_buf, u_sign_i2 + o * u_i2_stride, u_cols, sum_all_q2);
-        output[o] = static_cast<float>(acc) * inv_scale2 * u1[o];
-    }
+    at::parallel_for(0, out_features, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t o = begin; o < end; ++o) {
+            const int32_t acc = dot_int8_x_i2_row_avx2(
+                q2_buf, u_sign_i2 + o * u_i2_stride, u_cols, sum_all_q2);
+            output[o] = static_cast<float>(acc) * inv_scale2 * u1[o];
+        }
+    });
 #endif
 }
 
@@ -1391,23 +1400,25 @@ inline void rms_norm_inline(
 #endif
 }
 
+
+
+
 // Inline SiLU-mul without tensor allocation
+// ** OPTIMIZED: Uses fast AVX2 exp approximation instead of scalar std::exp **
 inline void silu_mul_inline(const float * gate, const float * up,
                              int64_t n, float * output) {
 #ifdef __AVX2__
+    const __m256 one = _mm256_set1_ps(1.0f);
     int64_t i = 0;
     for (; i + 8 <= n; i += 8) {
         __m256 g = _mm256_loadu_ps(gate + i);
         __m256 u = _mm256_loadu_ps(up + i);
-        // SiLU(g) = g * sigmoid(g)
-        // sigmoid(g) = 1 / (1 + exp(-g))
-        // We use fast approximation: compute exp(-g) using standard exp
-        alignas(32) float gb[8], sb[8];
-        _mm256_storeu_ps(gb, g);
-        for (int j = 0; j < 8; ++j)
-            sb[j] = gb[j] / (1.0f + std::exp(-gb[j]));
-        __m256 silu = _mm256_loadu_ps(sb);
-        _mm256_storeu_ps(output + i, _mm256_mul_ps(silu, u));
+        // sigmoid(g) = 1 / (1 + exp(-g))  using fast_exp
+        __m256 neg_g = _mm256_sub_ps(_mm256_setzero_ps(), g);
+        __m256 exp_neg = fast_exp_avx2(neg_g);
+        __m256 sigmoid = _mm256_div_ps(one, _mm256_add_ps(one, exp_neg));
+        // SiLU(g) * up = g * sigmoid(g) * up
+        _mm256_storeu_ps(output + i, _mm256_mul_ps(_mm256_mul_ps(g, sigmoid), u));
     }
     for (; i < n; ++i) {
         const float sig = 1.0f / (1.0f + std::exp(-gate[i]));
@@ -1439,15 +1450,16 @@ inline void fused_attention_inline(
                     v_new + h * head_dim, head_dim * sizeof(float));
     }
 
-    thread_local std::vector<float> scores_buf;
-    scores_buf.resize(seq_len);
+    // ** OPTIMIZED: Parallelize attention across all query heads **
+    const int64_t num_heads = num_kv_heads * kv_repeat;
+    at::parallel_for(0, num_heads, 0, [&](int64_t head_begin, int64_t head_end) {
+        // Each thread gets its own scores buffer
+        std::vector<float> local_scores(seq_len);
 
-    for (int64_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
-        const float * k_base = k_cache + kv_h * max_seq * head_dim;
-        const float * v_base = v_cache + kv_h * max_seq * head_dim;
-
-        for (int64_t r = 0; r < kv_repeat; ++r) {
-            const int64_t q_head = kv_h * kv_repeat + r;
+        for (int64_t q_head = head_begin; q_head < head_end; ++q_head) {
+            const int64_t kv_h = q_head / kv_repeat;
+            const float * k_base = k_cache + kv_h * max_seq * head_dim;
+            const float * v_base = v_cache + kv_h * max_seq * head_dim;
             const float * q_ptr = q + q_head * head_dim;
             float * out_ptr = output + q_head * head_dim;
 
@@ -1468,24 +1480,24 @@ inline void fused_attention_inline(
 #else
                 for (int64_t d = 0; d < head_dim; ++d) dot += q_ptr[d] * k_t[d];
 #endif
-                scores_buf[t] = dot * attn_scale;
+                local_scores[t] = dot * attn_scale;
             }
 
             // Softmax
-            float max_s = scores_buf[0];
-            for (int64_t t = 1; t < seq_len; ++t) max_s = std::max(max_s, scores_buf[t]);
+            float max_s = local_scores[0];
+            for (int64_t t = 1; t < seq_len; ++t) max_s = std::max(max_s, local_scores[t]);
             float sum_exp = 0.0f;
             for (int64_t t = 0; t < seq_len; ++t) {
-                scores_buf[t] = std::exp(scores_buf[t] - max_s);
-                sum_exp += scores_buf[t];
+                local_scores[t] = std::exp(local_scores[t] - max_s);
+                sum_exp += local_scores[t];
             }
             const float inv_sum = 1.0f / sum_exp;
-            for (int64_t t = 0; t < seq_len; ++t) scores_buf[t] *= inv_sum;
+            for (int64_t t = 0; t < seq_len; ++t) local_scores[t] *= inv_sum;
 
             // Attn × V
             std::memset(out_ptr, 0, head_dim * sizeof(float));
             for (int64_t t = 0; t < seq_len; ++t) {
-                const float prob = scores_buf[t];
+                const float prob = local_scores[t];
                 const float * v_t = v_base + t * head_dim;
 #ifdef __AVX2__
                 const __m256 pv = _mm256_set1_ps(prob);
@@ -1501,7 +1513,7 @@ inline void fused_attention_inline(
 #endif
             }
         }
-    }
+    });
 }
 
 at::Tensor full_forward_cpu(
@@ -1536,8 +1548,8 @@ at::Tensor full_forward_cpu(
     // Total: 7 * 4 = 28 ints per layer
 
     struct ForwardScratch {
-        std::vector<float> x;          // hidden state [hidden_size]
-        std::vector<float> residual;   // [hidden_size]
+        std::vector<float> buf0;       // double-buffer 0 [hidden_size]
+        std::vector<float> buf1;       // double-buffer 1 [hidden_size]
         std::vector<float> normed;     // [hidden_size]
         std::vector<float> proj_out;   // max(out_features) across all projections
         std::vector<float> q_out, k_out, v_out, o_out;
@@ -1560,8 +1572,9 @@ at::Tensor full_forward_cpu(
         else if (pos_in_layer % 4 == 3) max_o = std::max(max_o, layer_dims[i]); // out_features
     }
 
-    scratch.x.resize(hidden_size);
-    scratch.residual.resize(hidden_size);
+    // ** OPTIMIZED: double-buffer instead of separate x + residual (eliminates memcpy) **
+    scratch.buf0.resize(hidden_size);
+    scratch.buf1.resize(hidden_size);
     scratch.normed.resize(hidden_size);
     scratch.q_out.resize(max_o);
     scratch.k_out.resize(max_o);
@@ -1576,8 +1589,10 @@ at::Tensor full_forward_cpu(
     scratch.stage1_buf.resize(max_r);
     scratch.q2_buf.resize(max_r);
 
-    // Embedding: x = embed_weight[token_id]
-    std::memcpy(scratch.x.data(), embed_ptr + token_id * hidden_size,
+    // Embedding: buf0 = embed_weight[token_id]
+    float * x_ptr = scratch.buf0.data();
+    float * res_ptr = scratch.buf1.data();
+    std::memcpy(x_ptr, embed_ptr + token_id * hidden_size,
                 hidden_size * sizeof(float));
 
     const float eps = static_cast<float>(rms_eps);
@@ -1587,20 +1602,18 @@ at::Tensor full_forward_cpu(
         const int64_t tbase = layer * 37;  // tensor offset
         const int64_t dbase = layer * 28;  // dims offset
 
-        // layer_tensors[tbase + 0] = input_layernorm_weight
-        // layer_tensors[tbase + 1] = post_attention_layernorm_weight
         const float * ln1_w = layer_tensors[tbase + 0].data_ptr<float>();
         const float * ln2_w = layer_tensors[tbase + 1].data_ptr<float>();
 
-        // Save residual
-        std::memcpy(scratch.residual.data(), scratch.x.data(), hidden_size * sizeof(float));
+        // ** OPTIMIZED: pointer swap instead of memcpy for residual **
+        // residual = x (swap pointers, zero-copy)
+        std::swap(x_ptr, res_ptr);
+        // Now res_ptr holds old x (= residual), x_ptr is free for reuse
 
-        // RMSNorm
-        rms_norm_inline(scratch.x.data(), ln1_w, eps, hidden_size, scratch.normed.data());
+        // RMSNorm (reads from res_ptr which is the old x)
+        rms_norm_inline(res_ptr, ln1_w, eps, hidden_size, scratch.normed.data());
 
         // 7 projections: q=0, k=1, v=2, o=3, gate=4, up=5, down=6
-        // Each projection p at tensor offset: tbase + 2 + p*5
-        // Dims at: dbase + p*4 → [v_cols, rank, u_cols, out_features]
         auto do_proj = [&](int64_t p, const float * input_data, float * out_data) {
             const int64_t to = tbase + 2 + p * 5;
             const int64_t do_ = dbase + p * 4;
@@ -1644,15 +1657,26 @@ at::Tensor full_forward_cpu(
         // O projection: attn_out → o_out
         do_proj(3, scratch.attn_out.data(), scratch.o_out.data());
 
-        // Residual add
+        // Residual add: x = residual + o_out
+#ifdef __AVX2__
+        for (int64_t i = 0; i + 8 <= hidden_size; i += 8) {
+            _mm256_storeu_ps(x_ptr + i,
+                _mm256_add_ps(_mm256_loadu_ps(res_ptr + i),
+                              _mm256_loadu_ps(scratch.o_out.data() + i)));
+        }
+        for (int64_t i = (hidden_size / 8) * 8; i < hidden_size; ++i)
+            x_ptr[i] = res_ptr[i] + scratch.o_out[i];
+#else
         for (int64_t i = 0; i < hidden_size; ++i)
-            scratch.x[i] = scratch.residual[i] + scratch.o_out[i];
+            x_ptr[i] = res_ptr[i] + scratch.o_out[i];
+#endif
 
-        // MLP
-        std::memcpy(scratch.residual.data(), scratch.x.data(), hidden_size * sizeof(float));
+        // MLP: swap for second residual (x_ptr has attn_residual result)
+        std::swap(x_ptr, res_ptr);
+        // res_ptr = post-attn x, x_ptr = free
 
         // Post-attention RMSNorm
-        rms_norm_inline(scratch.x.data(), ln2_w, eps, hidden_size, scratch.normed.data());
+        rms_norm_inline(res_ptr, ln2_w, eps, hidden_size, scratch.normed.data());
 
         // Gate and Up projections
         do_proj(4, scratch.normed.data(), scratch.gate_out.data());
@@ -1666,18 +1690,24 @@ at::Tensor full_forward_cpu(
         // Down projection
         do_proj(6, scratch.mlp_hidden.data(), scratch.down_out.data());
 
-        // Residual add
+        // Residual add: x = residual + down_out
+#ifdef __AVX2__
+        for (int64_t i = 0; i + 8 <= hidden_size; i += 8) {
+            _mm256_storeu_ps(x_ptr + i,
+                _mm256_add_ps(_mm256_loadu_ps(res_ptr + i),
+                              _mm256_loadu_ps(scratch.down_out.data() + i)));
+        }
+        for (int64_t i = (hidden_size / 8) * 8; i < hidden_size; ++i)
+            x_ptr[i] = res_ptr[i] + scratch.down_out[i];
+#else
         for (int64_t i = 0; i < hidden_size; ++i)
-            scratch.x[i] = scratch.residual[i] + scratch.down_out[i];
+            x_ptr[i] = res_ptr[i] + scratch.down_out[i];
+#endif
     }
 
-    // Final RMSNorm
-    std::vector<float> final_out(hidden_size);
-    rms_norm_inline(scratch.x.data(), final_norm_ptr, eps, hidden_size, final_out.data());
-
-    // Return hidden state as tensor [1, hidden_size]
+    // Final RMSNorm — output directly to result tensor
     auto output = at::empty({1, hidden_size}, embed_weight.options());
-    std::memcpy(output.data_ptr<float>(), final_out.data(), hidden_size * sizeof(float));
+    rms_norm_inline(x_ptr, final_norm_ptr, eps, hidden_size, output.data_ptr<float>());
     return output;
 }
 
