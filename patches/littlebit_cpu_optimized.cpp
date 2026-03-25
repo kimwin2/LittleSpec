@@ -1353,7 +1353,8 @@ inline void lb_linear_i2_inline(
 
 #ifdef __AVX2__
     const int32_t sum_all_q2 = sum_int8_row_avx2(q2_buf, rank);
-    at::parallel_for(0, out_features, 0, [&](int64_t begin, int64_t end) {
+    // grain_size=1 ensures parallelization for large out_features (14336 for gate/up)
+    at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
         for (int64_t o = begin; o < end; ++o) {
             const int32_t acc = dot_int8_x_i2_row_avx2(
                 q2_buf, u_sign_i2 + o * u_i2_stride, u_cols, sum_all_q2);
@@ -1452,7 +1453,7 @@ inline void fused_attention_inline(
 
     // ** OPTIMIZED: Parallelize attention across all query heads **
     const int64_t num_heads = num_kv_heads * kv_repeat;
-    at::parallel_for(0, num_heads, 0, [&](int64_t head_begin, int64_t head_end) {
+    at::parallel_for(0, num_heads, 1, [&](int64_t head_begin, int64_t head_end) {
         // Each thread gets its own scores buffer
         std::vector<float> local_scores(seq_len);
 
@@ -1588,6 +1589,13 @@ at::Tensor full_forward_cpu(
     scratch.q1_buf.resize(max_v);
     scratch.stage1_buf.resize(max_r);
     scratch.q2_buf.resize(max_r);
+
+    // One-time diagnostic: log thread count
+    static std::once_flag diag_flag;
+    std::call_once(diag_flag, [&]() {
+        fprintf(stderr, "[littlebit_cpu] full_forward: at::get_num_threads()=%d\n",
+                static_cast<int>(at::get_num_threads()));
+    });
 
     // Embedding: buf0 = embed_weight[token_id]
     float * x_ptr = scratch.buf0.data();

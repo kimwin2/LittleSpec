@@ -42,6 +42,10 @@ CTX=512
 GEN_TOKENS=64
 PROMPT="Write a Python function to compute fibonacci numbers efficiently."
 
+# Ensure multi-threading for CPU kernels
+export OMP_NUM_THREADS=${THREADS}
+export MKL_NUM_THREADS=${THREADS}
+
 # SD settings
 DRAFT_LENGTHS="4"
 MAX_SAMPLES=5
@@ -149,6 +153,8 @@ echo "============================================================"
 
 python -c "
 import time, sys, torch
+torch.set_num_threads(${THREADS})
+print(f'PyTorch threads: {torch.get_num_threads()}', flush=True)
 sys.path.insert(0, 'lb_kernels')
 from cpu_draft_model import CPUDraftModel
 
