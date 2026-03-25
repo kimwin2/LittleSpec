@@ -1290,6 +1290,484 @@ at::Tensor fused_attention_cpu(
     return output;
 }
 
+// ============================================================================
+// Monolithic Full Forward Pass (all 32 layers in one C++ call)
+// ============================================================================
+
+// Per-layer tensor layout in the flat tensor list:
+// [0] input_layernorm_weight  (float32 [hidden_size])
+// [1] post_attention_layernorm_weight (float32 [hidden_size])
+// Then 7 projections (q, k, v, o, gate, up, down), each with 5 tensors:
+// [2+p*5+0] v2         (float32 [1, v_cols])
+// [2+p*5+1] v_sign_i2  (uint8 [rank, i2_bytes_per_row])
+// [2+p*5+2] mid        (float32 [1, rank])
+// [2+p*5+3] u_sign_i2  (uint8 [out_features, i2_bytes_per_row])
+// [2+p*5+4] u1         (float32 [1, out_features])
+// Total per layer: 2 + 7*5 = 37 tensors
+// Plus v_cols and u_cols passed as int list (7*2 = 14 per layer)
+
+// Inline LB linear (i2 kernel) without tensor allocation
+inline void lb_linear_i2_inline(
+    const float * input,      // [1, v_cols]
+    int64_t v_cols,
+    const float * v2,         // [v_cols]
+    const uint8_t * v_sign_i2,// [rank, i2_stride]
+    int64_t v_i2_stride,
+    const float * mid,        // [rank]
+    int64_t rank,
+    const uint8_t * u_sign_i2,// [out_features, u_i2_stride]
+    int64_t u_i2_stride,
+    const float * u1,         // [out_features]
+    int64_t out_features,
+    int64_t u_cols,           // = rank
+    float * output,           // [out_features]
+    int8_t * q1_buf,          // scratch [v_cols]
+    float * stage1_buf,       // scratch [rank]
+    int8_t * q2_buf           // scratch [rank]
+) {
+    // Stage 1: quantize(input * v2) × v_sign_i2 → stage1 × mid
+    const float scale1 = quantize_mul_row_to_int8(input, v2, v_cols, q1_buf);
+    const float inv_scale1 = 1.0f / scale1;
+
+#ifdef __AVX2__
+    const int32_t sum_all_q1 = sum_int8_row_avx2(q1_buf, v_cols);
+    for (int64_t r = 0; r < rank; ++r) {
+        const int32_t acc = dot_int8_x_i2_row_avx2(
+            q1_buf, v_sign_i2 + r * v_i2_stride, v_cols, sum_all_q1);
+        stage1_buf[r] = static_cast<float>(acc) * inv_scale1 * mid[r];
+    }
+#else
+    TORCH_CHECK(false, "full_forward requires AVX2");
+#endif
+
+    // Stage 2: quantize(stage1) × u_sign_i2 → output × u1
+    const float scale2 = quantize_row_to_int8(stage1_buf, rank, q2_buf);
+    const float inv_scale2 = 1.0f / scale2;
+
+#ifdef __AVX2__
+    const int32_t sum_all_q2 = sum_int8_row_avx2(q2_buf, rank);
+    for (int64_t o = 0; o < out_features; ++o) {
+        const int32_t acc = dot_int8_x_i2_row_avx2(
+            q2_buf, u_sign_i2 + o * u_i2_stride, u_cols, sum_all_q2);
+        output[o] = static_cast<float>(acc) * inv_scale2 * u1[o];
+    }
+#endif
+}
+
+// Inline RMSNorm without tensor allocation
+inline void rms_norm_inline(
+    const float * input, const float * weight, float eps,
+    int64_t hidden_size, float * output) {
+#ifdef __AVX2__
+    __m256 sum_sq = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 8 <= hidden_size; i += 8) {
+        __m256 v = _mm256_loadu_ps(input + i);
+        sum_sq = _mm256_fmadd_ps(v, v, sum_sq);
+    }
+    alignas(32) float tmp[8];
+    _mm256_storeu_ps(tmp, sum_sq);
+    float ss = 0.0f;
+    for (int j = 0; j < 8; ++j) ss += tmp[j];
+    for (; i < hidden_size; ++i) ss += input[i] * input[i];
+
+    const float rsqrt = 1.0f / std::sqrt(ss / static_cast<float>(hidden_size) + eps);
+
+    i = 0;
+    const __m256 vrsqrt = _mm256_set1_ps(rsqrt);
+    for (; i + 8 <= hidden_size; i += 8) {
+        _mm256_storeu_ps(output + i,
+            _mm256_mul_ps(
+                _mm256_mul_ps(_mm256_loadu_ps(input + i), vrsqrt),
+                _mm256_loadu_ps(weight + i)));
+    }
+    for (; i < hidden_size; ++i)
+        output[i] = input[i] * rsqrt * weight[i];
+#else
+    float ss = 0.0f;
+    for (int64_t i = 0; i < hidden_size; ++i) ss += input[i] * input[i];
+    const float rsqrt = 1.0f / std::sqrt(ss / static_cast<float>(hidden_size) + eps);
+    for (int64_t i = 0; i < hidden_size; ++i) output[i] = input[i] * rsqrt * weight[i];
+#endif
+}
+
+// Inline SiLU-mul without tensor allocation
+inline void silu_mul_inline(const float * gate, const float * up,
+                             int64_t n, float * output) {
+#ifdef __AVX2__
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 g = _mm256_loadu_ps(gate + i);
+        __m256 u = _mm256_loadu_ps(up + i);
+        // SiLU(g) = g * sigmoid(g)
+        // sigmoid(g) = 1 / (1 + exp(-g))
+        // We use fast approximation: compute exp(-g) using standard exp
+        alignas(32) float gb[8], sb[8];
+        _mm256_storeu_ps(gb, g);
+        for (int j = 0; j < 8; ++j)
+            sb[j] = gb[j] / (1.0f + std::exp(-gb[j]));
+        __m256 silu = _mm256_loadu_ps(sb);
+        _mm256_storeu_ps(output + i, _mm256_mul_ps(silu, u));
+    }
+    for (; i < n; ++i) {
+        const float sig = 1.0f / (1.0f + std::exp(-gate[i]));
+        output[i] = gate[i] * sig * up[i];
+    }
+#else
+    for (int64_t i = 0; i < n; ++i) {
+        const float sig = 1.0f / (1.0f + std::exp(-gate[i]));
+        output[i] = gate[i] * sig * up[i];
+    }
+#endif
+}
+
+// Inline fused attention without tensor allocation
+inline void fused_attention_inline(
+    const float * q, const float * k_new, const float * v_new,
+    float * k_cache, float * v_cache,
+    int64_t position, int64_t num_kv_heads, int64_t kv_repeat,
+    int64_t head_dim, int64_t max_seq, float attn_scale,
+    float * output   // [num_heads * head_dim]
+) {
+    const int64_t seq_len = position + 1;
+
+    // Write new K, V to cache
+    for (int64_t h = 0; h < num_kv_heads; ++h) {
+        std::memcpy(k_cache + h * max_seq * head_dim + position * head_dim,
+                    k_new + h * head_dim, head_dim * sizeof(float));
+        std::memcpy(v_cache + h * max_seq * head_dim + position * head_dim,
+                    v_new + h * head_dim, head_dim * sizeof(float));
+    }
+
+    thread_local std::vector<float> scores_buf;
+    scores_buf.resize(seq_len);
+
+    for (int64_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
+        const float * k_base = k_cache + kv_h * max_seq * head_dim;
+        const float * v_base = v_cache + kv_h * max_seq * head_dim;
+
+        for (int64_t r = 0; r < kv_repeat; ++r) {
+            const int64_t q_head = kv_h * kv_repeat + r;
+            const float * q_ptr = q + q_head * head_dim;
+            float * out_ptr = output + q_head * head_dim;
+
+            // Q × K^T
+            for (int64_t t = 0; t < seq_len; ++t) {
+                const float * k_t = k_base + t * head_dim;
+                float dot = 0.0f;
+#ifdef __AVX2__
+                __m256 acc = _mm256_setzero_ps();
+                int64_t d = 0;
+                for (; d + 8 <= head_dim; d += 8)
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(q_ptr + d),
+                                          _mm256_loadu_ps(k_t + d), acc);
+                alignas(32) float tmp[8];
+                _mm256_storeu_ps(tmp, acc);
+                for (int j = 0; j < 8; ++j) dot += tmp[j];
+                for (; d < head_dim; ++d) dot += q_ptr[d] * k_t[d];
+#else
+                for (int64_t d = 0; d < head_dim; ++d) dot += q_ptr[d] * k_t[d];
+#endif
+                scores_buf[t] = dot * attn_scale;
+            }
+
+            // Softmax
+            float max_s = scores_buf[0];
+            for (int64_t t = 1; t < seq_len; ++t) max_s = std::max(max_s, scores_buf[t]);
+            float sum_exp = 0.0f;
+            for (int64_t t = 0; t < seq_len; ++t) {
+                scores_buf[t] = std::exp(scores_buf[t] - max_s);
+                sum_exp += scores_buf[t];
+            }
+            const float inv_sum = 1.0f / sum_exp;
+            for (int64_t t = 0; t < seq_len; ++t) scores_buf[t] *= inv_sum;
+
+            // Attn × V
+            std::memset(out_ptr, 0, head_dim * sizeof(float));
+            for (int64_t t = 0; t < seq_len; ++t) {
+                const float prob = scores_buf[t];
+                const float * v_t = v_base + t * head_dim;
+#ifdef __AVX2__
+                const __m256 pv = _mm256_set1_ps(prob);
+                int64_t d = 0;
+                for (; d + 8 <= head_dim; d += 8) {
+                    __m256 o = _mm256_loadu_ps(out_ptr + d);
+                    o = _mm256_fmadd_ps(pv, _mm256_loadu_ps(v_t + d), o);
+                    _mm256_storeu_ps(out_ptr + d, o);
+                }
+                for (; d < head_dim; ++d) out_ptr[d] += prob * v_t[d];
+#else
+                for (int64_t d = 0; d < head_dim; ++d) out_ptr[d] += prob * v_t[d];
+#endif
+            }
+        }
+    }
+}
+
+at::Tensor full_forward_cpu(
+    int64_t token_id,
+    const at::Tensor & embed_weight,     // [vocab_size, hidden_size]
+    const at::Tensor & final_norm_weight, // [hidden_size]
+    at::TensorList layer_tensors,         // 37 tensors per layer × num_layers
+    at::TensorList kv_caches,             // 2 tensors per layer (k_cache, v_cache)
+    const std::vector<int64_t> & layer_dims,  // [v_cols, rank, u_cols_q, out_q, u_cols_k, out_k, ...] per proj
+    int64_t num_layers,
+    int64_t hidden_size,
+    int64_t num_kv_heads,
+    int64_t kv_repeat,
+    int64_t head_dim,
+    int64_t max_seq_len,
+    int64_t position,
+    double attn_scale,
+    double rms_eps) {
+
+    // Embedding lookup
+    const float * embed_ptr = embed_weight.data_ptr<float>();
+    const float * final_norm_ptr = final_norm_weight.data_ptr<float>();
+
+    // Pre-allocate scratch buffers (reused across all layers)
+    const int64_t max_v_cols = hidden_size;  // typically 4096
+    const int64_t max_rank = 256;            // safe upper bound
+    const int64_t max_out = hidden_size * 4; // for gate/up: intermediate_size
+
+    // Determine actual max dimensions from layer_dims
+    // layer_dims layout: per projection (7 per layer), each has 4 ints:
+    //   [v_cols, rank, u_cols, out_features]
+    // Total: 7 * 4 = 28 ints per layer
+
+    struct ForwardScratch {
+        std::vector<float> x;          // hidden state [hidden_size]
+        std::vector<float> residual;   // [hidden_size]
+        std::vector<float> normed;     // [hidden_size]
+        std::vector<float> proj_out;   // max(out_features) across all projections
+        std::vector<float> q_out, k_out, v_out, o_out;
+        std::vector<float> gate_out, up_out, down_out;
+        std::vector<float> mlp_hidden; // [intermediate_size]
+        std::vector<float> attn_out;   // [num_heads * head_dim]
+        std::vector<int8_t> q1_buf;
+        std::vector<float> stage1_buf;
+        std::vector<int8_t> q2_buf;
+    };
+    thread_local ForwardScratch scratch;
+
+    // Find max dimensions from first layer
+    const int64_t n_proj_dims = 28;  // 7 projections × 4 dims each
+    int64_t max_v = 0, max_r = 0, max_o = 0;
+    for (int64_t i = 0; i < static_cast<int64_t>(layer_dims.size()); ++i) {
+        int64_t pos_in_layer = i % n_proj_dims;
+        if (pos_in_layer % 4 == 0) max_v = std::max(max_v, layer_dims[i]);      // v_cols
+        else if (pos_in_layer % 4 == 1) max_r = std::max(max_r, layer_dims[i]); // rank
+        else if (pos_in_layer % 4 == 3) max_o = std::max(max_o, layer_dims[i]); // out_features
+    }
+
+    scratch.x.resize(hidden_size);
+    scratch.residual.resize(hidden_size);
+    scratch.normed.resize(hidden_size);
+    scratch.q_out.resize(max_o);
+    scratch.k_out.resize(max_o);
+    scratch.v_out.resize(max_o);
+    scratch.o_out.resize(max_o);
+    scratch.gate_out.resize(max_o);
+    scratch.up_out.resize(max_o);
+    scratch.down_out.resize(max_o);
+    scratch.mlp_hidden.resize(max_o);
+    scratch.attn_out.resize(hidden_size);
+    scratch.q1_buf.resize(max_v);
+    scratch.stage1_buf.resize(max_r);
+    scratch.q2_buf.resize(max_r);
+
+    // Embedding: x = embed_weight[token_id]
+    std::memcpy(scratch.x.data(), embed_ptr + token_id * hidden_size,
+                hidden_size * sizeof(float));
+
+    const float eps = static_cast<float>(rms_eps);
+    const float scale = static_cast<float>(attn_scale);
+
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+        const int64_t tbase = layer * 37;  // tensor offset
+        const int64_t dbase = layer * 28;  // dims offset
+
+        // layer_tensors[tbase + 0] = input_layernorm_weight
+        // layer_tensors[tbase + 1] = post_attention_layernorm_weight
+        const float * ln1_w = layer_tensors[tbase + 0].data_ptr<float>();
+        const float * ln2_w = layer_tensors[tbase + 1].data_ptr<float>();
+
+        // Save residual
+        std::memcpy(scratch.residual.data(), scratch.x.data(), hidden_size * sizeof(float));
+
+        // RMSNorm
+        rms_norm_inline(scratch.x.data(), ln1_w, eps, hidden_size, scratch.normed.data());
+
+        // 7 projections: q=0, k=1, v=2, o=3, gate=4, up=5, down=6
+        // Each projection p at tensor offset: tbase + 2 + p*5
+        // Dims at: dbase + p*4 → [v_cols, rank, u_cols, out_features]
+        auto do_proj = [&](int64_t p, const float * input_data, float * out_data) {
+            const int64_t to = tbase + 2 + p * 5;
+            const int64_t do_ = dbase + p * 4;
+
+            const int64_t v_cols = layer_dims[do_ + 0];
+            const int64_t rank = layer_dims[do_ + 1];
+            const int64_t u_cols = layer_dims[do_ + 2];
+            const int64_t out_f = layer_dims[do_ + 3];
+
+            const float * v2 = layer_tensors[to + 0].data_ptr<float>();
+            const uint8_t * v_i2 = layer_tensors[to + 1].data_ptr<uint8_t>();
+            const int64_t v_i2_stride = layer_tensors[to + 1].size(1);
+            const float * mid_p = layer_tensors[to + 2].data_ptr<float>();
+            const uint8_t * u_i2 = layer_tensors[to + 3].data_ptr<uint8_t>();
+            const int64_t u_i2_stride = layer_tensors[to + 3].size(1);
+            const float * u1 = layer_tensors[to + 4].data_ptr<float>();
+
+            lb_linear_i2_inline(
+                input_data, v_cols, v2,
+                v_i2, v_i2_stride, mid_p, rank,
+                u_i2, u_i2_stride, u1, out_f, u_cols,
+                out_data,
+                scratch.q1_buf.data(), scratch.stage1_buf.data(), scratch.q2_buf.data());
+        };
+
+        // Q, K, V projections
+        do_proj(0, scratch.normed.data(), scratch.q_out.data());
+        do_proj(1, scratch.normed.data(), scratch.k_out.data());
+        do_proj(2, scratch.normed.data(), scratch.v_out.data());
+
+        // Fused attention
+        float * k_cache = kv_caches[layer * 2 + 0].data_ptr<float>();
+        float * v_cache = kv_caches[layer * 2 + 1].data_ptr<float>();
+
+        fused_attention_inline(
+            scratch.q_out.data(), scratch.k_out.data(), scratch.v_out.data(),
+            k_cache, v_cache,
+            position, num_kv_heads, kv_repeat, head_dim,
+            max_seq_len, scale, scratch.attn_out.data());
+
+        // O projection: attn_out → o_out
+        do_proj(3, scratch.attn_out.data(), scratch.o_out.data());
+
+        // Residual add
+        for (int64_t i = 0; i < hidden_size; ++i)
+            scratch.x[i] = scratch.residual[i] + scratch.o_out[i];
+
+        // MLP
+        std::memcpy(scratch.residual.data(), scratch.x.data(), hidden_size * sizeof(float));
+
+        // Post-attention RMSNorm
+        rms_norm_inline(scratch.x.data(), ln2_w, eps, hidden_size, scratch.normed.data());
+
+        // Gate and Up projections
+        do_proj(4, scratch.normed.data(), scratch.gate_out.data());
+        do_proj(5, scratch.normed.data(), scratch.up_out.data());
+
+        // SiLU-mul
+        const int64_t intermediate_size = layer_dims[dbase + 4 * 4 + 3]; // gate out_features
+        silu_mul_inline(scratch.gate_out.data(), scratch.up_out.data(),
+                        intermediate_size, scratch.mlp_hidden.data());
+
+        // Down projection
+        do_proj(6, scratch.mlp_hidden.data(), scratch.down_out.data());
+
+        // Residual add
+        for (int64_t i = 0; i < hidden_size; ++i)
+            scratch.x[i] = scratch.residual[i] + scratch.down_out[i];
+    }
+
+    // Final RMSNorm
+    std::vector<float> final_out(hidden_size);
+    rms_norm_inline(scratch.x.data(), final_norm_ptr, eps, hidden_size, final_out.data());
+
+    // Return hidden state as tensor [1, hidden_size]
+    auto output = at::empty({1, hidden_size}, embed_weight.options());
+    std::memcpy(output.data_ptr<float>(), final_out.data(), hidden_size * sizeof(float));
+    return output;
+}
+
+// ============================================================================
+// INT8 quantized lm_head
+// ============================================================================
+
+// Quantize lm_head weight from FP32 to INT8 (per-row)
+// Returns: (int8_weight [vocab, hidden], scales [vocab])
+std::tuple<at::Tensor, at::Tensor> quantize_lm_head_cpu(const at::Tensor & weight) {
+    check_float32_tensor(weight, "weight");
+    const int64_t vocab = weight.size(0);
+    const int64_t hidden = weight.size(1);
+
+    auto q_weight = at::empty({vocab, hidden}, weight.options().dtype(at::kChar));
+    auto scales = at::empty({vocab}, weight.options().dtype(at::kFloat));
+
+    const float * w_ptr = weight.data_ptr<float>();
+    int8_t * q_ptr = q_weight.data_ptr<int8_t>();
+    float * s_ptr = scales.data_ptr<float>();
+
+    at::parallel_for(0, vocab, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            s_ptr[row] = quantize_row_to_int8(w_ptr + row * hidden, hidden, q_ptr + row * hidden);
+        }
+    });
+
+    return std::make_tuple(q_weight, scales);
+}
+
+// INT8 lm_head: int8_input × int8_weight^T with per-row scales
+at::Tensor lm_head_int8_cpu(
+    const at::Tensor & hidden_state,  // [1, hidden_size] float32
+    const at::Tensor & q_weight,      // [vocab, hidden_size] int8
+    const at::Tensor & weight_scales  // [vocab] float32
+) {
+    check_float32_tensor(hidden_state, "hidden_state");
+    check_cpu_tensor(q_weight, "q_weight");
+    check_float32_tensor(weight_scales, "weight_scales");
+
+    const int64_t hidden = hidden_state.size(1);
+    const int64_t vocab = q_weight.size(0);
+
+    // Quantize input to int8
+    thread_local std::vector<int8_t> input_q;
+    input_q.resize(hidden);
+    const float input_scale = quantize_row_to_int8(
+        hidden_state.data_ptr<float>(), hidden, input_q.data());
+    const float inv_input_scale = 1.0f / input_scale;
+
+    auto output = at::empty({1, vocab}, hidden_state.options());
+    float * out_ptr = output.data_ptr<float>();
+    const int8_t * q_ptr = q_weight.data_ptr<int8_t>();
+    const float * s_ptr = weight_scales.data_ptr<float>();
+
+    at::parallel_for(0, vocab, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            const int8_t * w_row = q_ptr + row * hidden;
+            int32_t dot = 0;
+#ifdef __AVX2__
+            __m256i acc = _mm256_setzero_si256();
+            int64_t i = 0;
+            for (; i + 32 <= hidden; i += 32) {
+                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input_q.data() + i));
+                const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w_row + i));
+                // sign_epi8(a, b) flips sign of a where b is negative
+                // Then maddubs + madd for accumulation
+                const __m256i abs_a = _mm256_abs_epi8(a);
+                const __m256i sign_b = _mm256_sign_epi8(b, b); // abs(b) where b positive, but we need different approach
+                // Actually for int8 × int8 dot product:
+                // Use _mm256_maddubs_epi16(abs(a), sign(a)*b) pattern
+                const __m256i a_sign = _mm256_sign_epi8(b, a); // b * sign(a)
+                const __m256i abs_a2 = _mm256_abs_epi8(a);
+                const __m256i prod16 = _mm256_maddubs_epi16(abs_a2, a_sign);
+                const __m256i ones16 = _mm256_set1_epi16(1);
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod16, ones16));
+            }
+            dot = hsum_epi32(acc);
+            for (; i < hidden; ++i) dot += static_cast<int32_t>(input_q[i]) * static_cast<int32_t>(w_row[i]);
+#else
+            for (int64_t i = 0; i < hidden; ++i)
+                dot += static_cast<int32_t>(input_q[i]) * static_cast<int32_t>(w_row[i]);
+#endif
+            out_ptr[row] = static_cast<float>(dot) * inv_input_scale / s_ptr[row];
+        }
+    });
+
+    return output;
+}
+
 }  // namespace littlebit_cpu_ops
 
 TORCH_LIBRARY(littlebit_cpu_ops, m) {
@@ -1320,6 +1798,21 @@ TORCH_LIBRARY(littlebit_cpu_ops, m) {
         "Tensor mid, Tensor u_sign_i2, int u_cols, Tensor u1"
         ") -> Tensor"
     );
+    m.def(
+        "full_forward("
+        "int token_id, Tensor embed_weight, Tensor final_norm_weight, "
+        "Tensor[] layer_tensors, Tensor[] kv_caches, "
+        "int[] layer_dims, int num_layers, int hidden_size, "
+        "int num_kv_heads, int kv_repeat, int head_dim, "
+        "int max_seq_len, int position, float attn_scale, float rms_eps"
+        ") -> Tensor"
+    );
+    m.def("quantize_lm_head(Tensor weight) -> (Tensor, Tensor)");
+    m.def(
+        "lm_head_int8("
+        "Tensor hidden_state, Tensor q_weight, Tensor weight_scales"
+        ") -> Tensor"
+    );
 }
 
 TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
@@ -1333,4 +1826,7 @@ TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
     m.impl("fused_attention", littlebit_cpu_ops::fused_attention_cpu);
     m.impl("repack_signs_to_i2", littlebit_cpu_ops::repack_signs_to_i2_cpu);
     m.impl("littlebit_linear_i2", littlebit_cpu_ops::littlebit_linear_i2_cpu);
+    m.impl("full_forward", littlebit_cpu_ops::full_forward_cpu);
+    m.impl("quantize_lm_head", littlebit_cpu_ops::quantize_lm_head_cpu);
+    m.impl("lm_head_int8", littlebit_cpu_ops::lm_head_int8_cpu);
 }
