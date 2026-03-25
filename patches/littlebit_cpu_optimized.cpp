@@ -1876,9 +1876,10 @@ int64_t generate_token_cpu(
     double rms_eps
 ) {
     // ===== Step 1: full_forward (reuse existing logic) =====
+    std::vector<int64_t> layer_dims_vec(layer_dims.begin(), layer_dims.end());
     at::Tensor hidden = full_forward_cpu(
         token_id, embed_weight, final_norm_weight,
-        layer_tensors, kv_caches, layer_dims,
+        layer_tensors, kv_caches, layer_dims_vec,
         num_layers, hidden_size, num_kv_heads, kv_repeat,
         head_dim, max_seq_len, position, attn_scale, rms_eps);
 
