@@ -24,7 +24,7 @@ MODEL_ID="meta-llama/Llama-3.1-8B-Instruct"
 DRAFT_MODEL_PATH="outputs/step1_draft_0.1bit/REPLACE_WITH_TIMESTAMP"
 
 # Dataset
-DATASET="wikitext2_sharegpt"
+DATASET="openhermes"
 DATA_ROOT="./"
 
 # (Optional) Path to local ShareGPT .jsonl file

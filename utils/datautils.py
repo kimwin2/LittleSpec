@@ -110,6 +110,8 @@ def get_qat_dataset(name, tokenizer, sharegpt_path=None):
         data = get_c4_wiki_train(tokenizer=tokenizer)
     elif name == "wikitext2_sharegpt":
         data = get_wikitext2_sharegpt_train(tokenizer=tokenizer, sharegpt_path=sharegpt_path)
+    elif name == "openhermes":
+        data = get_openhermes_train(tokenizer=tokenizer)
     return data
 
 
@@ -249,6 +251,111 @@ def get_wikitext2_sharegpt_train(tokenizer, sharegpt_path=None, seed=0, seqlen=2
 
     processed_dataset = tokenized_datasets.map(group_texts, batched=True, desc="Chunking")
     logger.info(f"wikitext2_sharegpt dataset prepared: {len(processed_dataset)} samples")
+    return processed_dataset
+
+
+def _convert_openhermes_to_chat_messages(conversations):
+    """Convert OpenHermes conversation format to chat messages list.
+
+    OpenHermes format: [{"from": "system", "value": "..."}, {"from": "human", "value": "..."}, ...]
+    Output format:     [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, ...]
+    """
+    role_map = {
+        "system": "system",
+        "human": "user",
+        "gpt": "assistant",
+    }
+    messages = []
+    for turn in conversations:
+        role = role_map.get(turn.get("from", ""), None)
+        content = turn.get("value", "").strip()
+        if role and content:
+            messages.append({"role": role, "content": content})
+    return messages
+
+
+def get_openhermes_train(tokenizer, num_samples=50000, seed=42, seqlen=2048):
+    """OpenHermes 2.5 dataset with Llama 3.1 chat template applied.
+
+    - Downloads teknium/OpenHermes-2.5 from HuggingFace
+    - Randomly samples `num_samples` conversations
+    - Applies tokenizer.apply_chat_template() for Llama 3.1 format
+    - Truncates to `seqlen` tokens, filters out very short samples
+    """
+    logger.info(f"Loading OpenHermes 2.5 dataset (sampling {num_samples} from ~1M)...")
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train")
+    logger.info(f"  Full dataset size: {len(dataset)}")
+
+    # Random sampling
+    dataset = dataset.shuffle(seed=seed).select(range(min(num_samples, len(dataset))))
+    logger.info(f"  Sampled {len(dataset)} conversations")
+
+    # Convert each conversation using chat template
+    all_input_ids = []
+    all_attention_mask = []
+    all_labels = []
+    skipped = 0
+    min_length = 32  # Skip conversations shorter than this
+
+    for i, example in enumerate(dataset):
+        conversations = example.get("conversations", [])
+        if not conversations:
+            skipped += 1
+            continue
+
+        messages = _convert_openhermes_to_chat_messages(conversations)
+        if len(messages) < 2:  # Need at least user + assistant
+            skipped += 1
+            continue
+
+        # Use tokenizer's built-in chat template (Llama 3.1 format)
+        try:
+            input_ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                return_tensors=None,  # Return plain list
+            )
+        except Exception as e:
+            if i < 3:
+                logger.warning(f"  Failed to apply chat template to sample {i}: {e}")
+            skipped += 1
+            continue
+
+        # Filter too short
+        if len(input_ids) < min_length:
+            skipped += 1
+            continue
+
+        # Truncate to seqlen
+        input_ids = input_ids[:seqlen]
+        attention_mask = [1] * len(input_ids)
+        labels = input_ids.copy()
+
+        # Pad to seqlen
+        pad_len = seqlen - len(input_ids)
+        if pad_len > 0:
+            pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+            input_ids = input_ids + [pad_token_id] * pad_len
+            attention_mask = attention_mask + [0] * pad_len
+            labels = labels + [-100] * pad_len
+
+        all_input_ids.append(input_ids)
+        all_attention_mask.append(attention_mask)
+        all_labels.append(labels)
+
+        if (i + 1) % 10000 == 0:
+            logger.info(f"  Processed {i + 1}/{len(dataset)} conversations...")
+
+    logger.info(f"  Skipped {skipped} conversations (empty/short/error)")
+    logger.info(f"  Final dataset: {len(all_input_ids)} samples, seqlen={seqlen}")
+
+    processed_dataset = datasets.Dataset.from_dict({
+        "input_ids": all_input_ids,
+        "attention_mask": all_attention_mask,
+        "labels": all_labels,
+    })
+
     return processed_dataset
 
 

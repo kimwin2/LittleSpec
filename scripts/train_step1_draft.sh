@@ -18,8 +18,8 @@ set -e
 # Model
 MODEL_ID="meta-llama/Llama-3.1-8B-Instruct"
 
-# Dataset: "wikitext2_sharegpt" mixes wikitext2 + ShareGPT
-DATASET="wikitext2_sharegpt"
+# Dataset: "openhermes" uses OpenHermes 2.5 with Llama 3.1 chat template
+DATASET="openhermes"
 DATA_ROOT="./"
 
 # (Optional) Path to local ShareGPT .jsonl file

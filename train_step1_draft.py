@@ -70,7 +70,7 @@ def get_args():
     parser.add_argument("--model_id", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--data_root", type=str, default="./")
     parser.add_argument("--dataset", type=str, default="wikitext2_sharegpt",
-                        choices=['c4', 'wikitext2', 'c4_wiki', 'wikitext2_sharegpt'])
+                        choices=['c4', 'wikitext2', 'c4_wiki', 'wikitext2_sharegpt', 'openhermes'])
     parser.add_argument("--sharegpt_path", type=str, default=None,
                         help="Path to local ShareGPT .jsonl file (optional)")
     parser.add_argument("--save_dir", type=str, default='outputs/step1_draft_0.1bit')
