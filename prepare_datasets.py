@@ -1,16 +1,18 @@
 """
 Dataset Preparation Script for Matryoshka Speculative Decoding
 
-Downloads and saves RAW TEXT only (no tokenization):
-1. Wikitext-2 (from HuggingFace)
-2. ShareGPT (from HuggingFace, multiple sources)
-
-Tokenization is handled at training time by datautils.py,
-so changing the model later does NOT require re-downloading.
+Downloads and caches datasets for QAT training:
+1. OpenHermes 2.5 (default) - teknium/OpenHermes-2.5 from HuggingFace
+2. Wikitext-2 (legacy) - wikitext-2-raw-v1 from HuggingFace
+3. ShareGPT (legacy) - from HuggingFace or local file
 
 Usage:
+    # Default: download OpenHermes 2.5 (recommended)
     python prepare_datasets.py --output_dir ./data
-    python prepare_datasets.py --sharegpt_path /path/to/sharegpt.jsonl --output_dir ./data
+
+    # Legacy: wikitext2 + ShareGPT
+    python prepare_datasets.py --output_dir ./data --mode legacy
+    python prepare_datasets.py --output_dir ./data --mode legacy --sharegpt_path /path/to/sharegpt.jsonl
 """
 
 import argparse
@@ -21,6 +23,23 @@ from datasets import load_dataset
 from utils.misc import setup_logger
 
 logger = setup_logger(__name__)
+
+
+def download_openhermes(num_samples=50000, seed=42):
+    """Download OpenHermes 2.5 dataset and return as a HuggingFace Dataset.
+
+    Returns the raw dataset (no tokenization) so it can be cached to disk.
+    Tokenization happens at training time via `get_openhermes_train()` in datautils.py.
+    """
+    logger.info(f"Downloading OpenHermes 2.5 from HuggingFace (sampling {num_samples})...")
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train")
+    logger.info(f"  Full dataset size: {len(dataset)}")
+
+    # Random sampling
+    dataset = dataset.shuffle(seed=seed).select(range(min(num_samples, len(dataset))))
+    logger.info(f"  Sampled {len(dataset)} conversations")
+
+    return dataset
 
 
 def download_wikitext2():
@@ -94,11 +113,11 @@ def download_sharegpt(sharegpt_path=None):
                     logger.info(f"    Parsing {filename}...")
                     with open(local_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    
+
                     if isinstance(data, list):
                         for item in data:
                             _extract_conversations(item, sharegpt_texts)
-                    
+
                     logger.info(f"    Extracted {len(sharegpt_texts)} turns from {filename}")
                 except Exception as e:
                     logger.warning(f"    Failed to load {filename}: {e}")
@@ -130,81 +149,116 @@ def _extract_conversations(item, output_list):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download raw datasets for QAT training")
+    parser = argparse.ArgumentParser(description="Download datasets for QAT training")
     parser.add_argument("--output_dir", type=str, default="./data",
-                        help="Directory to save raw text files")
+                        help="Directory to save dataset cache")
+    parser.add_argument("--mode", type=str, default="openhermes",
+                        choices=["openhermes", "legacy"],
+                        help="Dataset mode: 'openhermes' (default) or 'legacy' (wikitext2+ShareGPT)")
+    parser.add_argument("--num_samples", type=int, default=50000,
+                        help="Number of samples to use from OpenHermes 2.5 (default: 50000)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for sampling")
     parser.add_argument("--sharegpt_path", type=str, default=None,
-                        help="Path to local ShareGPT .jsonl/.json file (downloads from HF if not set)")
+                        help="(Legacy mode) Path to local ShareGPT .jsonl/.json file")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ============================
-    # 1. Wikitext-2
-    # ============================
-    logger.info("\n" + "=" * 60)
-    logger.info("Step 1: Wikitext-2")
-    logger.info("=" * 60)
-    wiki_text = download_wikitext2()
+    if args.mode == "openhermes":
+        # ============================
+        # OpenHermes 2.5 (recommended)
+        # ============================
+        logger.info("\n" + "=" * 60)
+        logger.info("Downloading OpenHermes 2.5 dataset")
+        logger.info("=" * 60)
 
-    wiki_path = os.path.join(args.output_dir, "wikitext2_raw.txt")
-    with open(wiki_path, "w", encoding="utf-8") as f:
-        f.write(wiki_text)
-    wiki_size_mb = os.path.getsize(wiki_path) / (1024 * 1024)
-    logger.info(f"  Saved to: {wiki_path} ({wiki_size_mb:.1f} MB)")
+        dataset = download_openhermes(
+            num_samples=args.num_samples,
+            seed=args.seed,
+        )
 
-    # ============================
-    # 2. ShareGPT
-    # ============================
-    logger.info("\n" + "=" * 60)
-    logger.info("Step 2: ShareGPT")
-    logger.info("=" * 60)
-    sharegpt_text = download_sharegpt(args.sharegpt_path)
+        # Save as HuggingFace dataset (Arrow format) for fast loading
+        save_path = os.path.join(args.output_dir, "openhermes_raw")
+        dataset.save_to_disk(save_path)
+        logger.info(f"  Saved to: {save_path}")
 
-    sharegpt_save_path = os.path.join(args.output_dir, "sharegpt_raw.txt")
-    if sharegpt_text:
-        with open(sharegpt_save_path, "w", encoding="utf-8") as f:
-            f.write(sharegpt_text)
-        sg_size_mb = os.path.getsize(sharegpt_save_path) / (1024 * 1024)
-        logger.info(f"  Saved to: {sharegpt_save_path} ({sg_size_mb:.1f} MB)")
+        # Print stats
+        num_convs = len(dataset)
+        total_turns = sum(
+            len(ex.get("conversations", [])) for ex in dataset
+        )
+
+        print("\n" + "=" * 60)
+        print("DATASET PREPARATION COMPLETE")
+        print("=" * 60)
+        print(f"  Dataset:       OpenHermes 2.5")
+        print(f"  Conversations: {num_convs:,}")
+        print(f"  Total turns:   {total_turns:,}")
+        print(f"  Saved to:      {save_path}")
+        print()
+        print("  Tokenization will happen automatically at training time")
+        print("  using the model's chat template (e.g. Llama 3.1 format).")
+        print()
+        print("  To train with this data:")
+        print("    --dataset openhermes")
+        print("=" * 60)
+
     else:
-        logger.warning("  ShareGPT download failed - check logs above")
+        # ============================
+        # Legacy: Wikitext-2 + ShareGPT
+        # ============================
+        logger.info("\n" + "=" * 60)
+        logger.info("Step 1: Wikitext-2")
+        logger.info("=" * 60)
+        wiki_text = download_wikitext2()
 
-    # ============================
-    # 3. Combined
-    # ============================
-    logger.info("\n" + "=" * 60)
-    logger.info("Step 3: Combined (wikitext2 + ShareGPT)")
-    logger.info("=" * 60)
+        wiki_path = os.path.join(args.output_dir, "wikitext2_raw.txt")
+        with open(wiki_path, "w", encoding="utf-8") as f:
+            f.write(wiki_text)
+        wiki_size_mb = os.path.getsize(wiki_path) / (1024 * 1024)
+        logger.info(f"  Saved to: {wiki_path} ({wiki_size_mb:.1f} MB)")
 
-    combined_text = wiki_text
-    if sharegpt_text:
-        combined_text = wiki_text + "\n\n" + sharegpt_text
+        logger.info("\n" + "=" * 60)
+        logger.info("Step 2: ShareGPT")
+        logger.info("=" * 60)
+        sharegpt_text = download_sharegpt(args.sharegpt_path)
 
-    combined_path = os.path.join(args.output_dir, "wikitext2_sharegpt_raw.txt")
-    with open(combined_path, "w", encoding="utf-8") as f:
-        f.write(combined_text)
-    combined_size_mb = os.path.getsize(combined_path) / (1024 * 1024)
-    logger.info(f"  Saved to: {combined_path} ({combined_size_mb:.1f} MB)")
+        sharegpt_save_path = os.path.join(args.output_dir, "sharegpt_raw.txt")
+        if sharegpt_text:
+            with open(sharegpt_save_path, "w", encoding="utf-8") as f:
+                f.write(sharegpt_text)
+            sg_size_mb = os.path.getsize(sharegpt_save_path) / (1024 * 1024)
+            logger.info(f"  Saved to: {sharegpt_save_path} ({sg_size_mb:.1f} MB)")
+        else:
+            logger.warning("  ShareGPT download failed - check logs above")
 
-    # ============================
-    # Summary
-    # ============================
-    print("\n" + "=" * 60)
-    print("DATASET PREPARATION COMPLETE (raw text only)")
-    print("=" * 60)
-    print(f"  wikitext2:          {wiki_path}  ({wiki_size_mb:.1f} MB)")
-    if sharegpt_text:
-        print(f"  sharegpt:           {sharegpt_save_path}  ({sg_size_mb:.1f} MB)")
-    print(f"  combined:           {combined_path}  ({combined_size_mb:.1f} MB)")
-    print()
-    print("  Tokenization will happen automatically at training time.")
-    print("  You can use any model - just change --model_id in the training script.")
-    print()
-    print("  To use this data with training scripts:")
-    print(f"    --sharegpt_path {sharegpt_save_path}")
-    print("    --dataset wikitext2_sharegpt")
-    print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info("Step 3: Combined (wikitext2 + ShareGPT)")
+        logger.info("=" * 60)
+
+        combined_text = wiki_text
+        if sharegpt_text:
+            combined_text = wiki_text + "\n\n" + sharegpt_text
+
+        combined_path = os.path.join(args.output_dir, "wikitext2_sharegpt_raw.txt")
+        with open(combined_path, "w", encoding="utf-8") as f:
+            f.write(combined_text)
+        combined_size_mb = os.path.getsize(combined_path) / (1024 * 1024)
+        logger.info(f"  Saved to: {combined_path} ({combined_size_mb:.1f} MB)")
+
+        print("\n" + "=" * 60)
+        print("DATASET PREPARATION COMPLETE (legacy mode)")
+        print("=" * 60)
+        print(f"  wikitext2:          {wiki_path}  ({wiki_size_mb:.1f} MB)")
+        if sharegpt_text:
+            print(f"  sharegpt:           {sharegpt_save_path}  ({sg_size_mb:.1f} MB)")
+        print(f"  combined:           {combined_path}  ({combined_size_mb:.1f} MB)")
+        print()
+        print("  To use this data with training scripts:")
+        print(f"    --sharegpt_path {sharegpt_save_path}")
+        print("    --dataset wikitext2_sharegpt")
+        print("=" * 60)
 
 
 if __name__ == "__main__":

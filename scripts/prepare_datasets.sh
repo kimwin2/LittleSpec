@@ -1,11 +1,11 @@
 #!/bin/bash
 # ==============================================================================
-# Dataset Preparation: Download wikitext2 + ShareGPT (raw text)
+# Dataset Preparation: Download OpenHermes 2.5
 # ==============================================================================
 #
-# Downloads raw text only (NO tokenization).
-# Tokenization happens automatically at training time with the model's tokenizer.
-# This means you can change models without re-downloading data.
+# Downloads and caches the OpenHermes 2.5 dataset from HuggingFace.
+# Tokenization happens automatically at training time with the model's
+# chat template (e.g. Llama 3.1 format).
 #
 # Run this ONCE before training.
 # ==============================================================================
@@ -16,33 +16,47 @@ set -e
 # USER CONFIGURATION
 # ===========================
 
-# Where to save raw text files
+# Where to save dataset cache
 OUTPUT_DIR="./data"
 
-# (Optional) Path to local ShareGPT .jsonl/.json file
-# If not set, will download from HuggingFace automatically
-SHAREGPT_PATH=""
-# Example: SHAREGPT_PATH="/data/sharegpt_train.jsonl"
+# Number of samples to use from OpenHermes 2.5 (~1M total)
+NUM_SAMPLES=50000
+
+# Random seed for sampling
+SEED=42
+
+# Dataset mode: "openhermes" (default) or "legacy" (wikitext2 + ShareGPT)
+MODE="openhermes"
+
+# (Legacy mode only) Path to local ShareGPT .jsonl/.json file
+# SHAREGPT_PATH=""
 
 # ===========================
 # RUN
 # ===========================
 
 echo "============================================================"
-echo "Dataset Preparation (raw text download)"
+echo "Dataset Preparation"
+echo "  Mode: ${MODE}"
 echo "  Output: ${OUTPUT_DIR}"
+if [ "${MODE}" = "openhermes" ]; then
+    echo "  Samples: ${NUM_SAMPLES}"
+fi
 echo "============================================================"
 
-SHAREGPT_ARG=""
-if [ -n "${SHAREGPT_PATH}" ]; then
-    SHAREGPT_ARG="--sharegpt_path ${SHAREGPT_PATH}"
+EXTRA_ARGS=""
+if [ "${MODE}" = "legacy" ] && [ -n "${SHAREGPT_PATH:-}" ]; then
+    EXTRA_ARGS="--sharegpt_path ${SHAREGPT_PATH}"
 fi
 
 python prepare_datasets.py \
     --output_dir ${OUTPUT_DIR} \
-    ${SHAREGPT_ARG}
+    --mode ${MODE} \
+    --num_samples ${NUM_SAMPLES} \
+    --seed ${SEED} \
+    ${EXTRA_ARGS}
 
 echo "============================================================"
 echo "Done! Now run training with:"
-echo "  --sharegpt_path ${OUTPUT_DIR}/sharegpt_raw.txt"
+echo "  --dataset openhermes"
 echo "============================================================"
