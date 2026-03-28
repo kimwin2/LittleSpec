@@ -14,8 +14,6 @@ dev
 *.egg-info
 *.o
 .vscode
-*.sh
-!setup_env.sh
 build
 dist
 outputs
@@ -23,6 +21,5 @@ wandb
 *.pkl
 c4_wiki
 ckpts/
-scripts/
 .cache/
 meta-llama/
