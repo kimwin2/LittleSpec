@@ -564,6 +564,7 @@ def initialize_residual_model_weights(residual_model, residual_weights):
     from quantization.functions import STEBinary
 
     calc_device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+    nan_layers = []
 
     for name, module in residual_model.named_modules():
         if isinstance(module, LittleBitLinear):
@@ -573,11 +574,26 @@ def initialize_residual_model_weights(residual_model, residual_weights):
 
                 logger.info(f"Re-initializing {name} from residual weights (shape={W_residual.shape})")
 
+                # Check input for NaN/Inf
+                if torch.isnan(W_residual).any() or torch.isinf(W_residual).any():
+                    logger.error(f"  WARNING: {name} residual weights contain NaN/Inf! Zeroing out.")
+                    W_residual = torch.zeros_like(W_residual)
+                    nan_layers.append(name)
+
                 W_calc = W_residual.to(calc_device)
                 split_dim = module.split_dim
 
                 U_t, S_t, V_t = torch.svd_lowrank(W_calc, q=split_dim)
                 Vh_t = V_t.t()
+
+                # Check SVD output for NaN
+                if torch.isnan(S_t).any() or torch.isnan(U_t).any() or torch.isnan(V_t).any():
+                    logger.error(f"  WARNING: SVD produced NaN for {name}! Using zeros.")
+                    nan_layers.append(f"{name}_svd")
+                    U_t = torch.zeros_like(U_t)
+                    S_t = torch.zeros(split_dim, device=calc_device)
+                    V_t = torch.zeros_like(V_t)
+                    Vh_t = V_t.t()
 
                 sqrt_S = torch.sqrt(torch.diag(S_t))[:, :split_dim]
 
@@ -594,6 +610,11 @@ def initialize_residual_model_weights(residual_model, residual_weights):
 
                 v1_new, v2_new = rank_one_decompose(torch.abs(V_new))
                 u1_new, u2_new = rank_one_decompose(torch.abs(U_new))
+
+                # Log parameter statistics for debugging
+                logger.info(f"  {name} stats: U_range=[{U_new.min():.4f}, {U_new.max():.4f}], "
+                           f"V_range=[{V_new.min():.4f}, {V_new.max():.4f}], "
+                           f"u1_max={u1_new.abs().max():.4f}, v1_max={v1_new.abs().max():.4f}")
 
                 dtype = module.U.dtype if hasattr(module, 'U') and module.U is not None else torch.bfloat16
                 device = 'cpu'
@@ -612,6 +633,86 @@ def initialize_residual_model_weights(residual_model, residual_weights):
                 logger.info(f"  -> Initialized {name} with split_dim={split_dim}")
             else:
                 logger.warning(f"No residual weight found for {name}, keeping default init")
+
+    if nan_layers:
+        logger.error(f"WARNING: {len(nan_layers)} layers had NaN issues: {nan_layers[:10]}")
+    return nan_layers
+
+
+def diagnose_step2_models(draft_model, residual_model, tokenizer, device):
+    """Run a quick diagnostic forward pass to detect NaN/Inf before training."""
+    logger.info("=" * 60)
+    logger.info("DIAGNOSTIC: Pre-training sanity check for Step 2")
+    logger.info("=" * 60)
+
+    # 1. Check weights for NaN/Inf
+    logger.info("[1/4] Checking draft model weights...")
+    draft_nan = 0
+    draft_inf = 0
+    for name, p in draft_model.named_parameters():
+        if torch.isnan(p.data).any():
+            draft_nan += 1
+            logger.error(f"  DRAFT NaN in: {name}")
+        if torch.isinf(p.data).any():
+            draft_inf += 1
+            logger.error(f"  DRAFT Inf in: {name}")
+    logger.info(f"  Draft weights: {draft_nan} NaN params, {draft_inf} Inf params")
+
+    logger.info("[2/4] Checking residual model weights...")
+    res_nan = 0
+    res_inf = 0
+    for name, p in residual_model.named_parameters():
+        if torch.isnan(p.data).any():
+            res_nan += 1
+            logger.error(f"  RESIDUAL NaN in: {name}")
+        if torch.isinf(p.data).any():
+            res_inf += 1
+            logger.error(f"  RESIDUAL Inf in: {name}")
+    logger.info(f"  Residual weights: {res_nan} NaN params, {res_inf} Inf params")
+
+    # 2. Test forward pass with dummy input
+    test_input = tokenizer("Hello world, this is a test.", return_tensors="pt")
+    test_ids = test_input["input_ids"].to(device)
+    test_mask = test_input["attention_mask"].to(device)
+
+    logger.info("[3/4] Testing draft model forward pass...")
+    try:
+        with torch.no_grad():
+            draft_out = draft_model(input_ids=test_ids, attention_mask=test_mask)
+        d_logits = draft_out.logits
+        logger.info(f"  Draft logits: shape={d_logits.shape}, "
+                    f"min={d_logits.min():.4f}, max={d_logits.max():.4f}, "
+                    f"mean={d_logits.mean():.4f}, "
+                    f"has_nan={torch.isnan(d_logits).any()}, "
+                    f"has_inf={torch.isinf(d_logits).any()}")
+    except Exception as e:
+        logger.error(f"  Draft forward FAILED: {e}")
+
+    logger.info("[4/4] Testing residual model forward pass...")
+    try:
+        with torch.no_grad():
+            res_out = residual_model(input_ids=test_ids, attention_mask=test_mask)
+        r_logits = res_out.logits
+        logger.info(f"  Residual logits: shape={r_logits.shape}, "
+                    f"min={r_logits.min():.4f}, max={r_logits.max():.4f}, "
+                    f"mean={r_logits.mean():.4f}, "
+                    f"has_nan={torch.isnan(r_logits).any()}, "
+                    f"has_inf={torch.isinf(r_logits).any()}")
+
+        # Combined logits check
+        combined = d_logits + r_logits
+        logger.info(f"  Combined logits: "
+                    f"min={combined.min():.4f}, max={combined.max():.4f}, "
+                    f"has_nan={torch.isnan(combined).any()}, "
+                    f"has_inf={torch.isinf(combined).any()}")
+    except Exception as e:
+        logger.error(f"  Residual forward FAILED: {e}")
+
+    logger.info("=" * 60)
+    logger.info("DIAGNOSTIC COMPLETE")
+    logger.info("=" * 60)
+
+    return draft_nan + draft_inf + res_nan + res_inf
 
 
 def save_step2_artifacts(trainer, residual_model, tokenizer, save_dir, args, draft_model_path):
@@ -810,6 +911,19 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
     combined_model.draft_model.eval()
 
     print_trainable_parameters(combined_model.residual_model)
+
+    # ===== Step E.5: Diagnostic check before training =====
+    # Move residual model to GPU temporarily for diagnostic
+    residual_model.to(draft_device)
+    diagnose_step2_models(
+        draft_model=combined_model.draft_model,
+        residual_model=residual_model,
+        tokenizer=tokenizer,
+        device=draft_device,
+    )
+    residual_model.to('cpu')  # Move back to CPU for DeepSpeed initialization
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # ===== Step F: Train =====
     logger.info("Loading teacher model for KD...")
