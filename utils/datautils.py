@@ -88,7 +88,8 @@ def prepare_dataset(args, tokenizer):
 
     if need_regenerate:
         logger.info("Generating new dataset using get_qat_dataset")
-        datasets = get_qat_dataset(args.dataset, tokenizer, sharegpt_path=getattr(args, 'sharegpt_path', None), data_root=args.data_root)
+        num_samples = getattr(args, 'num_samples', 50000)
+        datasets = get_qat_dataset(args.dataset, tokenizer, sharegpt_path=getattr(args, 'sharegpt_path', None), data_root=args.data_root, num_samples=num_samples)
         if len(datasets) == 0:
             raise ValueError(
                 f"Generated dataset for '{args.dataset}' has 0 samples. "
@@ -114,7 +115,7 @@ def load_tokenizer(model_id):
     return tokenizer
 
 
-def get_qat_dataset(name, tokenizer, sharegpt_path=None, data_root="./"):
+def get_qat_dataset(name, tokenizer, sharegpt_path=None, data_root="./", num_samples=50000):
     if name == "wikitext2":
         data = get_wikitext2_train(tokenizer=tokenizer)
     elif name == "c4":
@@ -124,7 +125,7 @@ def get_qat_dataset(name, tokenizer, sharegpt_path=None, data_root="./"):
     elif name == "wikitext2_sharegpt":
         data = get_wikitext2_sharegpt_train(tokenizer=tokenizer, sharegpt_path=sharegpt_path)
     elif name == "openhermes":
-        data = get_openhermes_train(tokenizer=tokenizer, data_root=data_root)
+        data = get_openhermes_train(tokenizer=tokenizer, data_root=data_root, num_samples=num_samples)
     return data
 
 

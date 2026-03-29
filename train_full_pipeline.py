@@ -820,6 +820,8 @@ def get_args():
     parser.add_argument("--data_root", type=str, default="./")
     parser.add_argument("--dataset", type=str, default="wikitext2_sharegpt",
                         choices=['c4', 'wikitext2', 'c4_wiki', 'wikitext2_sharegpt', 'openhermes'])
+    parser.add_argument("--num_samples", type=int, default=50000,
+                        help="Number of samples to use from OpenHermes 2.5 (default: 50000)")
     parser.add_argument("--sharegpt_path", type=str, default=None,
                         help="Path to local ShareGPT .jsonl file (optional)")
 
