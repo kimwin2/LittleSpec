@@ -348,17 +348,30 @@ class MatryoshkaResidualModel(nn.Module):
     
     Forward pass: logits = draft_logits + residual_logits
     Only the residual model parameters are trainable.
+    
+    IMPORTANT: The draft model is stored outside the nn.Module hierarchy
+    (via object.__setattr__) to prevent DeepSpeed ZeRO-3 from trying to
+    partition its parameters. ZeRO-3 adds hooks to all registered submodules
+    and expects ds_status on their parameters, but the draft model is loaded
+    as a regular model without ZeRO-3 initialization.
     """
     def __init__(self, draft_model, residual_model, config):
         super().__init__()
-        self.draft_model = draft_model
+        # Store draft model OUTSIDE nn.Module hierarchy to avoid DeepSpeed ZeRO-3
+        # hooks. Using object.__setattr__ bypasses nn.Module.__setattr__ which
+        # would register it as a child module.
+        object.__setattr__(self, '_draft_model', draft_model)
         self.residual_model = residual_model
         self._config = config
         
         # Freeze draft model completely
-        for param in self.draft_model.parameters():
+        for param in self._draft_model.parameters():
             param.requires_grad = False
-        self.draft_model.eval()
+        self._draft_model.eval()
+    
+    @property
+    def draft_model(self):
+        return self._draft_model
     
     @property
     def config(self):
@@ -366,9 +379,22 @@ class MatryoshkaResidualModel(nn.Module):
     
     def forward(self, input_ids=None, attention_mask=None, labels=None, 
                 output_hidden_states=False, **kwargs):
+        draft = self._draft_model
+        
+        # Lazy device sync: move draft model to same device as input if needed
+        # (draft model is not managed by DeepSpeed, so we handle placement manually)
+        if input_ids is not None:
+            try:
+                draft_device = next(draft.parameters()).device
+                if draft_device != input_ids.device:
+                    logger.info(f"Moving draft model from {draft_device} to {input_ids.device}")
+                    draft.to(input_ids.device)
+            except StopIteration:
+                pass
+        
         # Draft forward (frozen, no grad)
         with torch.no_grad():
-            draft_outputs = self.draft_model(
+            draft_outputs = draft(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=output_hidden_states,
@@ -775,9 +801,13 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
 
     combined_model.residual_model.gradient_checkpointing_enable()
 
-    if device_map:
-        target = device_map if isinstance(device_map, (str, torch.device)) else list(device_map.values())[0]
-        combined_model.to(target)
+    # Move draft model to GPU explicitly (it's not managed by DeepSpeed).
+    # The residual model will be placed by DeepSpeed during trainer.train().
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    draft_device = f'cuda:{local_rank}'
+    logger.info(f"Moving draft model to {draft_device} (not managed by DeepSpeed)...")
+    combined_model.draft_model.to(draft_device)
+    combined_model.draft_model.eval()
 
     print_trainable_parameters(combined_model.residual_model)
 
