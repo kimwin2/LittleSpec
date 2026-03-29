@@ -325,6 +325,16 @@ def run_step1(args, tokenizer, datasets, num_gpus, device_map, step1_save_dir):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # Clear the HfDeepSpeedConfig global state left by Step 1's teacher model.
+    # Without this, Step 2's from_pretrained(device_map="cpu") will fail with
+    # "DeepSpeed Zero-3 is not compatible with passing a device_map".
+    try:
+        from transformers.integrations.deepspeed import unset_hf_deepspeed_config
+        unset_hf_deepspeed_config()
+        logger.info("Cleared HfDeepSpeedConfig after Step 1 cleanup")
+    except (ImportError, Exception) as e:
+        logger.warning(f"Could not unset HfDeepSpeedConfig: {e}")
+
     return step1_save_dir
 
 
