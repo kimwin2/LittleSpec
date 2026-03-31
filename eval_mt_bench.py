@@ -543,8 +543,9 @@ def evaluate_model_mt_bench(model_name, generate_fn, tokenizer, questions,
             turn_responses.append(response)
             messages.append({"role": "assistant", "content": response})
 
-            if turn_idx == 0:
-                logger.info(f"    Turn 1 ({elapsed:.1f}s): {response[:100]}...")
+            logger.info(f"    Turn {turn_idx+1} ({elapsed:.1f}s, {len(response)} chars):")
+            logger.info(f"    [Q] {turn_text[:120]}{'...' if len(turn_text) > 120 else ''}")
+            logger.info(f"    [A] {response[:500]}{'...' if len(response) > 500 else ''}")
 
         answer_record = {
             "question_id": qid,
