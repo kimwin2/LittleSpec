@@ -18,7 +18,7 @@ set -e
 # ===========================
 
 # Model
-BASE_MODEL_ID="meta-llama/Llama-3.1-8B-Instruct"
+BASE_MODEL_ID="/group-volume/ym1012.kim/homepc/EAGLE/Llama-3.1-8B-Instruct"
 
 # Trained model paths (UPDATE THESE)
 DRAFT_MODEL_PATH="outputs/step1_draft_0.1bit/2026_03_28_15_10"
@@ -58,18 +58,18 @@ echo "  Judge:       ${JUDGE} (${JUDGE_MODEL})"
 echo "============================================================"
 
 python eval_mt_bench.py \
-    --base_model_id ${BASE_MODEL_ID} \
-    --draft_model_path ${DRAFT_MODEL_PATH} \
-    --residual_model_path ${RESIDUAL_MODEL_PATH} \
-    --eval_draft ${EVAL_DRAFT} \
-    --eval_target ${EVAL_TARGET} \
-    --eval_fp ${EVAL_FP} \
+    --base_model_id "${BASE_MODEL_ID}" \
+    --draft_model_path "${DRAFT_MODEL_PATH}" \
+    --residual_model_path "${RESIDUAL_MODEL_PATH}" \
+    --eval_draft "${EVAL_DRAFT}" \
+    --eval_target "${EVAL_TARGET}" \
+    --eval_fp "${EVAL_FP}" \
     --max_new_tokens ${MAX_NEW_TOKENS} \
     --temperature ${TEMPERATURE} \
     --max_questions ${MAX_QUESTIONS} \
-    --judge ${JUDGE} \
-    --judge_model ${JUDGE_MODEL} \
-    --output_dir ${OUTPUT_DIR}
+    --judge "${JUDGE}" \
+    --judge_model "${JUDGE_MODEL}" \
+    --output_dir "${OUTPUT_DIR}"
 
 echo "============================================================"
 echo "MT-Bench Evaluation Complete!"
