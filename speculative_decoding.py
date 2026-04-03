@@ -6,9 +6,10 @@ Supports two decode modes:
 2. "tree": EAGLE-style tree attention — drafts a tree of candidates,
            verifies all branches in ONE target model forward pass
 
-Supports two target modes:
+Supports three target modes:
 1. "fp": Draft=0.1-bit, Target=original FP model (pre-Step2)
 2. "matryoshka": Draft=0.1-bit, Target=0.1+0.9-bit combined (post-Step2)
+3. "littlebit_cpu": Draft+Target both use C++ LittleBit kernel on CPU
 
 Usage (serial, FP target):
     python speculative_decoding.py \
@@ -631,6 +632,21 @@ def load_target_model(args, device):
             args.draft_model_path, args.residual_model_path,
             torch_dtype=torch.bfloat16, device=str(device)
         )
+    elif args.target_mode == "littlebit_cpu":
+        from cpu_target_model import CPUTargetModel
+        draft_rt = getattr(args, 'draft_runtime_path', None)
+        residual_rt = getattr(args, 'residual_runtime_path', None)
+        if not draft_rt or not residual_rt:
+            raise ValueError(
+                "--draft_runtime_path and --residual_runtime_path required "
+                "for littlebit_cpu target mode"
+            )
+        logger.info("Loading CPU LittleBit target model (draft + residual kernel)...")
+        return CPUTargetModel(
+            draft_runtime_path=draft_rt,
+            residual_runtime_path=residual_rt,
+            base_model_id=args.base_model_id,
+        )
     else:
         raise ValueError(f"Unknown target_mode: {args.target_mode}")
 
@@ -662,8 +678,12 @@ def main():
     parser.add_argument("--residual_model_path", type=str, default=None,
                         help="Path to 0.9-bit residual model (required for target_mode=matryoshka)")
     parser.add_argument("--target_mode", type=str, default="fp",
-                        choices=["fp", "matryoshka"],
-                        help="Target model type: 'fp'=original FP model, 'matryoshka'=0.1+0.9 combined")
+                        choices=["fp", "matryoshka", "littlebit_cpu"],
+                        help="Target model type: 'fp'=original FP, 'matryoshka'=0.1+0.9 combined, 'littlebit_cpu'=CPU kernel")
+    parser.add_argument("--draft_runtime_path", type=str, default=None,
+                        help="Path to draft model runtime checkpoint (for littlebit_cpu target)")
+    parser.add_argument("--residual_runtime_path", type=str, default=None,
+                        help="Path to residual model runtime checkpoint (for littlebit_cpu target)")
     parser.add_argument("--decode_mode", type=str, default="serial",
                         choices=["serial", "tree"],
                         help="Decode mode: 'serial'=sequential draft, 'tree'=EAGLE tree attention")

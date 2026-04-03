@@ -401,8 +401,12 @@ def main():
     parser.add_argument("--residual_model_path", type=str, default=None,
                         help="Path to 0.9-bit residual model (required for target_mode=matryoshka)")
     parser.add_argument("--target_mode", type=str, default="fp",
-                        choices=["fp", "matryoshka"],
-                        help="Target model type: 'fp'=original FP model, 'matryoshka'=0.1+0.9 combined")
+                        choices=["fp", "matryoshka", "littlebit_cpu"],
+                        help="Target model type: 'fp'=original FP, 'matryoshka'=0.1+0.9 combined, 'littlebit_cpu'=CPU kernel")
+    parser.add_argument("--draft_runtime_path", type=str, default=None,
+                        help="Path to draft model runtime checkpoint (for littlebit_cpu target)")
+    parser.add_argument("--residual_runtime_path", type=str, default=None,
+                        help="Path to residual model runtime checkpoint (for littlebit_cpu target)")
     parser.add_argument("--decode_mode", type=str, default="serial",
                         choices=["serial", "tree"],
                         help="Decode mode: 'serial'=sequential draft, 'tree'=EAGLE tree attention")
@@ -432,7 +436,11 @@ def main():
     greedy = args.mode == "greedy"
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     
-    target_desc = "FP (original)" if args.target_mode == "fp" else "Matryoshka (0.1+0.9 bit)"
+    target_desc = (
+        "FP (original)" if args.target_mode == "fp"
+        else "CPU LittleBit (draft+residual kernel)" if args.target_mode == "littlebit_cpu"
+        else "Matryoshka (0.1+0.9 bit)"
+    )
     
     # Load tokenizer
     logger.info("Loading tokenizer...")
