@@ -41,7 +41,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from quantization.utils.quant_util import load_quantized_model
 from utils.datautils import load_tokenizer
-from utils.misc import setup_logger, str2bool
+from utils.misc import setup_logger
 
 logger = setup_logger(__name__)
 
