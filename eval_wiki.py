@@ -226,17 +226,30 @@ def load_draft_model_for_eval(draft_model_path, base_model_id=None, device="auto
 
 
 @torch.no_grad()
-def eval_ppl_standalone(model, tokenizer, datasets="wikitext2", seqlen=2048):
+def eval_ppl_standalone(model, tokenizer, datasets="wikitext2", seqlen=None):
     """Standalone PPL evaluation — no lm_eval / BaseLM needed.
+
+    Matches eval.py's evaluate_model PPL logic exactly.
 
     Args:
         model: HuggingFace CausalLM model (already on device).
         tokenizer: Tokenizer.
         datasets: Comma-separated dataset names (e.g. "wikitext2" or "wikitext2,c4").
-        seqlen: Sequence length for evaluation chunks.
+        seqlen: Sequence length for evaluation chunks. If None, auto-detect from model config.
     """
     device = next(model.parameters()).device
     model.eval()
+
+    # Auto-detect seqlen from model config (same as eval.py)
+    if seqlen is None:
+        actual_model = model.module if hasattr(model, "module") else model
+        seqlen = getattr(actual_model.config, "n_ctx",
+                         getattr(actual_model.config, "max_position_embeddings", 2048))
+        # Cap at 2048 for practical evaluation (matches standard practice)
+        if seqlen > 2048:
+            seqlen = 2048
+    print(f"[INFO] Using seqlen = {seqlen}")
+
     results = {}
 
     for dataset in datasets.split(","):
@@ -249,21 +262,25 @@ def eval_ppl_standalone(model, tokenizer, datasets="wikitext2", seqlen=2048):
         testenc = testloader.input_ids
         nsamples = testenc.numel() // seqlen
 
+        if nsamples == 0:
+            print(f"Not enough data for PPL evaluation on {dataset} with seqlen {seqlen}. Skipping.")
+            continue
+
         nlls = []
         for i in tqdm(range(nsamples), desc=f"PPL({dataset})"):
-            batch = testenc[:, (i * seqlen):(i + 1) * seqlen].to(device, dtype=torch.long)
+            batch = testenc[:, (i * seqlen):((i + 1) * seqlen)].to(device)
             outputs = model(batch, use_cache=False)
             logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
 
-            shift_logits = logits[:, :-1, :]
-            shift_labels = batch[:, 1:]
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = batch[:, 1:].contiguous()
 
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
-            neg_log_likelihood = loss.float() * seqlen
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            neg_log_likelihood = loss.float() * (seqlen - 1)
             nlls.append(neg_log_likelihood)
 
-        ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen))
+        ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * (seqlen - 1)))
         print(f"[{dataset}] PPL = {ppl.item():.4f}")
         results[dataset] = ppl.item()
 
