@@ -3,13 +3,9 @@ import json
 import os
 import torch
 import torch.nn as nn
-from lm_eval import evaluator
-from lm_eval.base import BaseLM
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from modeling import (LittleBitGemma2ForCausalLM, LittleBitGemma3ForCausalLM, LittleBitLlamaForCausalLM,
-                      LittleBitOPTForCausalLM, LittleBitPhi4ForCausalLM, LittleBitQwQForCausalLM)
 from quantization.utils.quant_util import load_quantized_model
 from utils.datautils import get_eval_loaders
 
@@ -216,6 +212,51 @@ def load_draft_model_for_eval(draft_model_path, base_model_id=None, device="auto
     return model, tokenizer
 
 
+@torch.no_grad()
+def eval_ppl_standalone(model, tokenizer, datasets="wikitext2", seqlen=2048):
+    """Standalone PPL evaluation — no lm_eval / BaseLM needed.
+
+    Args:
+        model: HuggingFace CausalLM model (already on device).
+        tokenizer: Tokenizer.
+        datasets: Comma-separated dataset names (e.g. "wikitext2" or "wikitext2,c4").
+        seqlen: Sequence length for evaluation chunks.
+    """
+    device = next(model.parameters()).device
+    model.eval()
+    results = {}
+
+    for dataset in datasets.split(","):
+        dataset = dataset.strip()
+        if not dataset:
+            continue
+
+        print(f"[INFO] Starting PPL eval for: {dataset}")
+        testloader = get_eval_loaders(dataset, tokenizer)
+        testenc = testloader.input_ids
+        nsamples = testenc.numel() // seqlen
+
+        nlls = []
+        for i in tqdm(range(nsamples), desc=f"PPL({dataset})"):
+            batch = testenc[:, (i * seqlen):(i + 1) * seqlen].to(device, dtype=torch.long)
+            outputs = model(batch, use_cache=False)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs["logits"]
+
+            shift_logits = logits[:, :-1, :]
+            shift_labels = batch[:, 1:]
+
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+            neg_log_likelihood = loss.float() * seqlen
+            nlls.append(neg_log_likelihood)
+
+        ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen))
+        print(f"[{dataset}] PPL = {ppl.item():.4f}")
+        results[dataset] = ppl.item()
+
+    return results
+
+
 def main(args):
     # === Draft model path: load via load_quantized_model ===
     if args.draft_model_path:
@@ -225,10 +266,21 @@ def main(args):
             base_model_id=args.model_id,
             device="auto",
         )
-        accelerator = None
 
-    # === Standard path: model_type + LM.from_pretrained ===
+        # Standalone PPL eval (no lm_eval / BaseLM dependency)
+        eval_ppl_standalone(
+            model=model,
+            tokenizer=tokenizer,
+            datasets=args.ppl_task,
+        )
+
+    # === Standard path: model_type + LM.from_pretrained (requires modeling + lm_eval) ===
     else:
+        from lm_eval import evaluator
+        from lm_eval.base import BaseLM
+        from modeling import (LittleBitGemma2ForCausalLM, LittleBitGemma3ForCausalLM, LittleBitLlamaForCausalLM,
+                              LittleBitOPTForCausalLM, LittleBitPhi4ForCausalLM, LittleBitQwQForCausalLM)
+
         lm_dict = {
             "llama": LittleBitLlamaForCausalLM,
             "gemma2": LittleBitGemma2ForCausalLM,
@@ -271,14 +323,14 @@ def main(args):
             tokenizer = AutoTokenizer.from_pretrained(args.model_id, device_map="auto", use_fast=False,
                                                       trust_remote_code=True)
 
-    _ = evaluate_model(
-        model=model,
-        tokenizer=tokenizer,
-        tasks=args.zeroshot_task,
-        eval_ppl=args.ppl_task,
-        batch_size=args.batch_size,
-        accelerator=accelerator,
-    )
+        _ = evaluate_model(
+            model=model,
+            tokenizer=tokenizer,
+            tasks=args.zeroshot_task,
+            eval_ppl=args.ppl_task,
+            batch_size=args.batch_size,
+            accelerator=accelerator,
+        )
 
 
 if __name__ == "__main__":
