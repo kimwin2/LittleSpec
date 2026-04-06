@@ -84,12 +84,12 @@ DRAFT_MODEL_PATH=""
 
 if [ "${SKIP_STEP0}" != "true" ]; then
     echo "============================================================"
-    echo "Step 0: Regenerating responses using target model"
+    echo "Step 0: Regenerating responses using target model (vLLM)"
     echo "  Model:       ${MODEL_ID}"
     echo "  Prompts:     ${NUM_SAMPLES} from OpenHermes"
     echo "  Output:      ${REGEN_OUTPUT_DIR}"
     echo "  Max tokens:  ${REGEN_MAX_NEW_TOKENS}"
-    echo "  Batch size:  ${REGEN_BATCH_SIZE}"
+    echo "  Backend:     vLLM (continuous batching)"
     echo "============================================================"
 
     # Check if already generated
@@ -103,8 +103,9 @@ if [ "${SKIP_STEP0}" != "true" ]; then
             --data_root ${DATA_ROOT} \
             --num_samples ${NUM_SAMPLES} \
             --max_new_tokens ${REGEN_MAX_NEW_TOKENS} \
-            --batch_size ${REGEN_BATCH_SIZE} \
-            --dtype bfloat16
+            --backend vllm \
+            --tensor_parallel_size 1 \
+            --gpu_memory_utilization 0.85
     fi
 else
     echo "Skipping Step 0 (regeneration) -- using existing data"

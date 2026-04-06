@@ -9,24 +9,32 @@ target model during speculative decoding.
 Approach (following P-EAGLE / SpecBundle methodology):
   1. Extract user prompts from OpenHermes 2.5
   2. Generate responses using the target model (greedy, temperature=0)
-  3. Save as Arrow dataset for fast loading during training
+  3. Save as JSONL dataset for fast loading during training
+
+Supports two backends:
+  - vLLM (default, recommended): ~100-500 samples/s via continuous batching
+  - HuggingFace (fallback): ~5-20 samples/s
 
 Usage:
+    # Fast mode with vLLM (recommended):
     python prepare_regen_dataset.py \
         --model_id /path/to/Llama-3.1-8B-Instruct \
         --output_dir ./data/regen_hermes \
-        --num_samples 100000 \
-        --max_new_tokens 1024 \
-        --batch_size 8
+        --num_samples 100000
+
+    # Fallback with HuggingFace:
+    python prepare_regen_dataset.py \
+        --model_id /path/to/Llama-3.1-8B-Instruct \
+        --backend hf \
+        --batch_size 32
 """
 
 import argparse
+import json
 import os
 import time
 
-import torch
 from datasets import load_dataset, load_from_disk, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.misc import setup_logger
 
@@ -94,47 +102,131 @@ def extract_user_prompts(num_samples=100000, seed=42, data_root="./"):
     return prompts
 
 
-def generate_responses(
-    model, tokenizer, prompts, max_new_tokens=1024, batch_size=4
-):
-    """Generate responses using the target model for each prompt.
+# ==============================================================================
+# Backend: vLLM (recommended, ~100-500 samples/s)
+# ==============================================================================
 
-    Returns list of dicts with 'messages' (full conversation) and 'text' (raw text).
+def generate_responses_vllm(model_id, tokenizer, prompts, max_new_tokens=1024,
+                            tensor_parallel_size=1, gpu_memory_utilization=0.85):
+    """Generate responses using vLLM for maximum throughput.
+
+    vLLM uses continuous batching + PagedAttention, giving 10-50x speedup
+    over naive HuggingFace generate().
     """
+    from vllm import LLM, SamplingParams
+
+    logger.info(f"Initializing vLLM engine (tp={tensor_parallel_size}, "
+                f"gpu_util={gpu_memory_utilization})...")
+
+    llm = LLM(
+        model=model_id,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        max_model_len=4096,
+    )
+
+    sampling_params = SamplingParams(
+        temperature=0,  # Greedy — matches target model distribution exactly
+        max_tokens=max_new_tokens,
+        stop_token_ids=[tokenizer.eos_token_id],
+    )
+
+    # Prepare prompt strings with chat template
+    logger.info("Applying chat templates to prompts...")
+    prompt_texts = []
+    valid_indices = []
+    for i, messages in enumerate(prompts):
+        try:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            prompt_texts.append(text)
+            valid_indices.append(i)
+        except Exception as e:
+            if i < 5:
+                logger.warning(f"  Failed to apply template for sample {i}: {e}")
+
+    logger.info(f"Prepared {len(prompt_texts)} prompts for generation")
+
+    # Generate all at once — vLLM handles batching internally
+    start_time = time.time()
+    logger.info("Starting vLLM generation (all prompts submitted at once)...")
+    outputs = llm.generate(prompt_texts, sampling_params)
+    elapsed = time.time() - start_time
+
+    logger.info(f"vLLM generation complete: {len(outputs)} responses in {elapsed/60:.1f}min "
+                f"({len(outputs)/elapsed:.1f} samples/s)")
+
+    # Collect results
+    results = []
+    for output, orig_idx in zip(outputs, valid_indices):
+        response_text = output.outputs[0].text
+        full_messages = list(prompts[orig_idx]) + [
+            {"role": "assistant", "content": response_text}
+        ]
+        results.append({
+            "messages": full_messages,
+            "response": response_text,
+        })
+
+    return results
+
+
+# ==============================================================================
+# Backend: HuggingFace (fallback, ~5-20 samples/s)
+# ==============================================================================
+
+def generate_responses_hf(model_id, tokenizer, prompts, max_new_tokens=1024,
+                          batch_size=32, dtype="bfloat16"):
+    """Generate responses using HuggingFace generate() with optimizations."""
+    import torch
+
+    torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
+
+    logger.info(f"Loading model with HuggingFace (dtype={dtype})...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch_dtype,
+        device_map="auto",
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2",  # Use FlashAttention if available
+    )
     model.eval()
+
+    # IMPORTANT: left-padding for decoder-only generation
+    tokenizer.padding_side = "left"
+
     device = next(model.parameters()).device
     results = []
     total = len(prompts)
 
     logger.info(f"Generating responses for {total} prompts (batch_size={batch_size}, "
                 f"max_new_tokens={max_new_tokens})...")
-
     start_time = time.time()
 
     for i in range(0, total, batch_size):
         batch_prompts = prompts[i:i + batch_size]
         batch_texts = []
+        batch_valid = []
 
-        for messages in batch_prompts:
+        for j, messages in enumerate(batch_prompts):
             try:
                 prompt_text = tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
                 batch_texts.append(prompt_text)
-            except Exception as e:
-                logger.warning(f"  Failed to apply chat template for sample {i}: {e}")
-                batch_texts.append(None)
+                batch_valid.append(j)
+            except Exception:
+                continue
 
-        # Filter out failed ones
-        valid_indices = [j for j, t in enumerate(batch_texts) if t is not None]
-        valid_texts = [batch_texts[j] for j in valid_indices]
-
-        if not valid_texts:
+        if not batch_texts:
             continue
 
-        # Tokenize batch
+        # Tokenize with left-padding
         inputs = tokenizer(
-            valid_texts, return_tensors="pt", padding=True,
+            batch_texts, return_tensors="pt", padding=True,
             truncation=True, max_length=2048
         ).to(device)
 
@@ -143,19 +235,16 @@ def generate_responses(
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,  # Greedy — matches target model distribution exactly
-                temperature=1.0,
-                top_p=1.0,
+                do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
 
         # Decode responses
-        for k, j in enumerate(valid_indices):
+        for k, j in enumerate(batch_valid):
             input_len = inputs["input_ids"][k].shape[0]
             response_ids = outputs[k][input_len:]
             response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
 
-            # Build full conversation (prompt + generated response)
             full_messages = list(batch_prompts[j]) + [
                 {"role": "assistant", "content": response_text}
             ]
@@ -172,18 +261,26 @@ def generate_responses(
             eta = (total - done) / rate if rate > 0 else 0
             logger.info(f"  [{done}/{total}] {rate:.1f} samples/s, ETA: {eta/60:.1f}min")
 
+    # Free memory
+    del model
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     elapsed_total = time.time() - start_time
     logger.info(f"Generation complete: {len(results)} responses in {elapsed_total/60:.1f}min")
     return results
 
 
-def save_as_dataset(results, output_dir):
-    """Save regenerated conversations as a HuggingFace Arrow dataset."""
-    import json
+# ==============================================================================
+# Save
+# ==============================================================================
 
+def save_as_dataset(results, output_dir):
+    """Save regenerated conversations as JSONL."""
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save as JSON lines for portability
     jsonl_path = os.path.join(output_dir, "regen_conversations.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for r in results:
@@ -199,6 +296,10 @@ def save_as_dataset(results, output_dir):
     logger.info(f"Saved Arrow dataset to {output_dir}")
 
 
+# ==============================================================================
+# Main
+# ==============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate target-model-aligned training data"
@@ -213,26 +314,39 @@ def main():
                         help="Number of prompts to extract from OpenHermes")
     parser.add_argument("--max_new_tokens", type=int, default=1024,
                         help="Maximum new tokens per response")
-    parser.add_argument("--batch_size", type=int, default=4,
-                        help="Batch size for generation")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Batch size for HF backend (ignored for vLLM)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", type=str, default="bfloat16",
-                        choices=["float16", "bfloat16"],
-                        help="Model dtype")
+                        choices=["float16", "bfloat16"])
+    parser.add_argument("--backend", type=str, default="vllm",
+                        choices=["vllm", "hf"],
+                        help="Generation backend: vllm (fast) or hf (fallback)")
+    parser.add_argument("--tensor_parallel_size", type=int, default=1,
+                        help="Number of GPUs for vLLM tensor parallelism")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.85,
+                        help="GPU memory utilization for vLLM (0.0-1.0)")
 
     args = parser.parse_args()
 
     # Check if already generated
-    if os.path.exists(os.path.join(args.output_dir, "dataset_info.json")):
+    if os.path.exists(os.path.join(args.output_dir, "regen_conversations.jsonl")):
         logger.info(f"Regenerated dataset already exists at {args.output_dir}. Skipping.")
+        logger.info(f"  (Delete {args.output_dir} to force regeneration)")
         return
 
     logger.info("=" * 60)
     logger.info("Target Model Response Regeneration Pipeline")
     logger.info(f"  Model:       {args.model_id}")
+    logger.info(f"  Backend:     {args.backend}")
     logger.info(f"  Output:      {args.output_dir}")
     logger.info(f"  Num samples: {args.num_samples}")
     logger.info(f"  Max tokens:  {args.max_new_tokens}")
+    if args.backend == "vllm":
+        logger.info(f"  TP size:     {args.tensor_parallel_size}")
+        logger.info(f"  GPU util:    {args.gpu_memory_utilization}")
+    else:
+        logger.info(f"  Batch size:  {args.batch_size}")
     logger.info("=" * 60)
 
     # Step 1: Extract user prompts
@@ -241,33 +355,40 @@ def main():
         num_samples=args.num_samples, seed=args.seed, data_root=args.data_root
     )
 
-    # Step 2: Load target model and generate responses
-    logger.info("\n[Step 2/3] Loading target model and generating responses...")
-    torch_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-
+    # Load tokenizer for chat template
+    from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch_dtype,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    # Step 2: Generate responses
+    logger.info(f"\n[Step 2/3] Generating responses using {args.backend} backend...")
 
-    results = generate_responses(
-        model, tokenizer, prompts,
-        max_new_tokens=args.max_new_tokens,
-        batch_size=args.batch_size,
-    )
+    if args.backend == "vllm":
+        try:
+            results = generate_responses_vllm(
+                model_id=args.model_id,
+                tokenizer=tokenizer,
+                prompts=prompts,
+                max_new_tokens=args.max_new_tokens,
+                tensor_parallel_size=args.tensor_parallel_size,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+            )
+        except ImportError:
+            logger.warning("vLLM not installed! Falling back to HuggingFace backend.")
+            logger.warning("  Install vLLM: pip install vllm")
+            args.backend = "hf"
 
-    # Free model memory
-    del model
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if args.backend == "hf":
+        from transformers import AutoModelForCausalLM
+        results = generate_responses_hf(
+            model_id=args.model_id,
+            tokenizer=tokenizer,
+            prompts=prompts,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+            dtype=args.dtype,
+        )
 
     # Step 3: Save dataset
     logger.info("\n[Step 3/3] Saving regenerated dataset...")
