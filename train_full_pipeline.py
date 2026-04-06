@@ -909,8 +909,19 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
         gc.collect()
 
         # Step E: Save initialized state to temp file
+        # IMPORTANT: Use raw named_parameters + named_buffers instead of
+        # model.state_dict(), because LittleBitLinear.state_dict() overrides
+        # U/V keys to U_packed/V_packed format. If we save packed format,
+        # load_state_dict(strict=False) on the receiving model will silently
+        # skip U and V (key mismatch), leaving them uninitialized.
         logger.info(f"[Rank 0] Saving initialized state to {temp_init_path}...")
-        torch.save(residual_model_init.state_dict(), temp_init_path)
+        raw_state = {}
+        for k, p in residual_model_init.named_parameters():
+            raw_state[k] = p.data.cpu()
+        for k, b in residual_model_init.named_buffers():
+            raw_state[k] = b.cpu()
+        torch.save(raw_state, temp_init_path)
+        logger.info(f"[Rank 0] Saved {len(raw_state)} raw parameter/buffer entries.")
 
         del residual_model_init
         gc.collect()
@@ -950,9 +961,21 @@ def run_step2(args, tokenizer, datasets, num_gpus, device_map, draft_model_path,
     residual_model = apply_littlebit_patch(residual_model, step2_args, do_train=True)
 
     # Load the initialized weights computed by rank 0
+    # Now using raw format (not packed), so all keys (U, V, u1, u2, v1, v2) match directly.
     logger.info(f"[Rank {local_rank}] Loading initialized state from {temp_init_path}...")
     init_state = torch.load(temp_init_path, map_location='cpu')
-    residual_model.load_state_dict(init_state, strict=False)
+    missing, unexpected = residual_model.load_state_dict(init_state, strict=False)
+    if missing:
+        logger.warning(f"[Rank {local_rank}] Missing keys during init load: {len(missing)} keys")
+        # Log first few for debugging
+        for k in missing[:5]:
+            logger.warning(f"  MISSING: {k}")
+    if unexpected:
+        logger.warning(f"[Rank {local_rank}] Unexpected keys during init load: {len(unexpected)} keys")
+        for k in unexpected[:5]:
+            logger.warning(f"  UNEXPECTED: {k}")
+    if not missing and not unexpected:
+        logger.info(f"[Rank {local_rank}] All {len(init_state)} keys loaded successfully.")
     del init_state
     gc.collect()
 
