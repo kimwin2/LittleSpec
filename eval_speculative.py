@@ -162,11 +162,43 @@ def load_summarization_prompts(max_samples=50):
         return fallback[:max_samples]
 
 
+def load_ifeval_prompts(max_samples=50):
+    """Load IFEval (Instruction Following Eval) prompts.
+
+    IFEval tests instruction following ability with verifiable constraints
+    (e.g., "write exactly 3 paragraphs", "include the word 'ocean'").
+    This is a good benchmark for speculative decoding because:
+    - Prompts are short and diverse
+    - Responses are moderate length
+    - No external tooling needed for speed/acceptance measurement
+    """
+    try:
+        dataset = load_dataset("google/IFEval", split="train")
+        prompts = [item["prompt"] for item in dataset]
+        return prompts[:max_samples]
+    except Exception as e:
+        logger.warning(f"Failed to load IFEval: {e}. Using fallback prompts.")
+        fallback = [
+            "Write a 200 word summary of the benefits of renewable energy. Your response must contain exactly 3 paragraphs. Separate paragraphs with a blank line.",
+            "List 5 reasons why exercise is important. Use bullet points. Each bullet point must be a single sentence. The first word of each bullet must be a verb.",
+            "Explain what machine learning is in simple terms. Your entire response must be in lowercase. Do not use the word 'algorithm'.",
+            "Write a short story about a robot. The story must be exactly 100 words. Include the word 'sunset' at least twice.",
+            "Describe three cooking techniques. Use numbered list format. Each description must be between 20 and 40 words.",
+            "Write a haiku about the ocean. Follow this with a brief explanation of what a haiku is. Your response must contain exactly 5 sentences.",
+            "Explain quantum computing to a 10-year-old. Do not use any words longer than 8 characters. Keep your response under 150 words.",
+            "List the planets in our solar system. After each planet name, include one interesting fact. Use exactly 8 bullet points.",
+            "Write a persuasive paragraph about reading books. Include at least 3 statistics or numbers. The paragraph must start with the word 'Reading'.",
+            "Describe your favorite season without naming it. Use exactly 4 sentences. Include at least one metaphor.",
+        ]
+        return fallback[:max_samples]
+
+
 BENCHMARK_LOADERS = {
     "mt_bench": load_mt_bench_prompts,
     "gsm8k": load_gsm8k_prompts,
     "humaneval": load_humaneval_prompts,
     "summarization": load_summarization_prompts,
+    "ifeval": load_ifeval_prompts,
 }
 
 
@@ -416,7 +448,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=10,
                         help="Top-K for tree draft expansion (tree mode only)")
     parser.add_argument("--benchmark", type=str, default="all",
-                        choices=["all", "mt_bench", "gsm8k", "humaneval", "summarization"],
+                        choices=["all", "mt_bench", "gsm8k", "humaneval", "summarization", "ifeval"],
                         help="Which benchmark to run")
     parser.add_argument("--max_samples", type=int, default=50,
                         help="Maximum samples per benchmark")

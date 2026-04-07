@@ -23,10 +23,10 @@ set -e
 FP_MODEL_DIR="/group-volume/ym1012.kim/homepc/EAGLE/Llama-3.1-8B-Instruct"
 
 # HF checkpoint (original trained output)
-HF_CKPT_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.1bit/2026_03_23_13_29"
+HF_CKPT_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.3bit_regen/2026_04_06_16_17"
 
 # Runtime checkpoint (from convert_hf_to_runtime.py)
-RUNTIME_CKPT_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.1bit/2026_03_23_13_29_runtime"
+RUNTIME_CKPT_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.3bit_regen/2026_04_06_16_17_runtime"
 
 # GGUF for llama.cpp FP16 baseline
 GGUF_DIR="/group-volume/ym1012.kim/homepc/LittleSpec/gguf_models"
@@ -263,7 +263,7 @@ python eval_speculative.py \
     --draft_model_path ${RUNTIME_CKPT_DIR} \
     --target_mode fp \
     --draft_device cpu_kernel \
-    --benchmark humaneval \
+    --benchmark ifeval \
     --max_samples ${MAX_SAMPLES} \
     --max_new_tokens ${MAX_NEW_TOKENS} \
     --draft_lengths ${DRAFT_LENGTHS} \
