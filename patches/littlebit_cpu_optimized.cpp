@@ -1840,6 +1840,245 @@ at::Tensor full_forward_cpu(
 }
 
 // ============================================================================
+// Batch Forward Pass: N tokens in one call (speculative decoding verify)
+// ============================================================================
+
+at::Tensor full_forward_batch_cpu(
+    const at::Tensor & token_ids,         // [N] int64
+    const at::Tensor & embed_weight,      // [vocab, hidden_size]
+    const at::Tensor & final_norm_weight, // [hidden_size]
+    at::TensorList layer_tensors,         // 37 tensors per layer
+    at::TensorList kv_caches,             // 2 per layer (k_cache, v_cache)
+    const std::vector<int64_t> & layer_dims,
+    int64_t num_layers,
+    int64_t hidden_size,
+    int64_t num_kv_heads,
+    int64_t kv_repeat,
+    int64_t head_dim,
+    int64_t max_seq_len,
+    int64_t start_position,
+    double attn_scale,
+    double rms_eps) {
+
+    const int64_t N = token_ids.size(0);
+    if (N == 0) return at::empty({0, hidden_size}, embed_weight.options());
+
+    const auto * tok_ptr = token_ids.data_ptr<int64_t>();
+    const float * embed_ptr = embed_weight.data_ptr<float>();
+    const float * final_norm_ptr = final_norm_weight.data_ptr<float>();
+    const float eps_f = static_cast<float>(rms_eps);
+    const float scale_f = static_cast<float>(attn_scale);
+    const int64_t num_heads = num_kv_heads * kv_repeat;
+
+    // Find max dimensions
+    const int64_t n_proj_dims = 28;
+    int64_t max_v = 0, max_r = 0, max_o = 0;
+    for (int64_t i = 0; i < static_cast<int64_t>(layer_dims.size()); ++i) {
+        int64_t p = i % n_proj_dims;
+        if (p % 4 == 0) max_v = std::max(max_v, layer_dims[i]);
+        else if (p % 4 == 1) max_r = std::max(max_r, layer_dims[i]);
+        else if (p % 4 == 3) max_o = std::max(max_o, layer_dims[i]);
+    }
+
+    // Batch buffers
+    std::vector<float> buf0(N * hidden_size);
+    std::vector<float> buf1(N * hidden_size);
+    std::vector<float> normed_b(N * hidden_size);
+    std::vector<float> q_b(N * max_o), k_b(N * max_o), v_b(N * max_o);
+    std::vector<float> o_b(N * max_o);
+    std::vector<float> gate_b(N * max_o), up_b(N * max_o);
+    std::vector<float> down_b(N * max_o), mlp_b(N * max_o);
+    std::vector<float> attn_b(N * hidden_size);
+    std::vector<int8_t> q1_s(max_v), q2_s(max_r);
+    std::vector<float> s1_s(max_r);
+
+    static std::once_flag batch_diag;
+    std::call_once(batch_diag, [&]() {
+        fprintf(stderr, "[littlebit_cpu] full_forward_batch: N=%d, threads=%d\n",
+                static_cast<int>(N), static_cast<int>(at::get_num_threads()));
+    });
+
+    // Embedding
+    float * x = buf0.data();
+    float * res = buf1.data();
+    for (int64_t t = 0; t < N; ++t)
+        std::memcpy(x + t * hidden_size,
+                    embed_ptr + tok_ptr[t] * hidden_size,
+                    hidden_size * sizeof(float));
+
+    // Inline LB linear for one token
+    auto lb_one = [&](const float * inp, float * out,
+                      int64_t proj, int64_t lay) {
+        const int64_t to = lay * 37 + 2 + proj * 5;
+        const int64_t d  = lay * 28 + proj * 4;
+        lb_linear_i2_inline(
+            inp, layer_dims[d],
+            layer_tensors[to].data_ptr<float>(),
+            layer_tensors[to+1].data_ptr<uint8_t>(),
+            layer_tensors[to+1].size(1),
+            layer_tensors[to+2].data_ptr<float>(),
+            layer_dims[d+1],
+            layer_tensors[to+3].data_ptr<uint8_t>(),
+            layer_tensors[to+3].size(1),
+            layer_tensors[to+4].data_ptr<float>(),
+            layer_dims[d+3], layer_dims[d+2],
+            out, q1_s.data(), s1_s.data(), q2_s.data());
+    };
+
+    for (int64_t lay = 0; lay < num_layers; ++lay) {
+        const float * ln1_w = layer_tensors[lay*37].data_ptr<float>();
+        const float * ln2_w = layer_tensors[lay*37+1].data_ptr<float>();
+
+        // === Attention block ===
+        std::swap(x, res);
+        for (int64_t t = 0; t < N; ++t)
+            rms_norm_inline(res + t*hidden_size, ln1_w, eps_f,
+                           hidden_size, normed_b.data() + t*hidden_size);
+
+        const int64_t q_dim = layer_dims[lay*28 + 0*4 + 3];
+        const int64_t k_dim = layer_dims[lay*28 + 1*4 + 3];
+        const int64_t v_dim = layer_dims[lay*28 + 2*4 + 3];
+
+        for (int64_t t = 0; t < N; ++t) {
+            lb_one(normed_b.data()+t*hidden_size, q_b.data()+t*q_dim, 0, lay);
+            lb_one(normed_b.data()+t*hidden_size, k_b.data()+t*k_dim, 1, lay);
+            lb_one(normed_b.data()+t*hidden_size, v_b.data()+t*v_dim, 2, lay);
+        }
+
+        // Write all K,V to cache, then attend causally
+        float * kc = kv_caches[lay*2].data_ptr<float>();
+        float * vc = kv_caches[lay*2+1].data_ptr<float>();
+        for (int64_t t = 0; t < N; ++t) {
+            const int64_t pos = start_position + t;
+            for (int64_t h = 0; h < num_kv_heads; ++h) {
+                std::memcpy(kc + h*max_seq_len*head_dim + pos*head_dim,
+                           k_b.data() + t*k_dim + h*head_dim,
+                           head_dim * sizeof(float));
+                std::memcpy(vc + h*max_seq_len*head_dim + pos*head_dim,
+                           v_b.data() + t*v_dim + h*head_dim,
+                           head_dim * sizeof(float));
+            }
+        }
+
+        // Causal attention per token
+        for (int64_t t = 0; t < N; ++t) {
+            const int64_t pos = start_position + t;
+            const int64_t slen = pos + 1;
+            const float * qt = q_b.data() + t*q_dim;
+            float * ot = attn_b.data() + t*hidden_size;
+
+            #pragma omp parallel for schedule(static)
+            for (int64_t qh = 0; qh < num_heads; ++qh) {
+                const int64_t kvh = qh / kv_repeat;
+                const float * kb = kc + kvh*max_seq_len*head_dim;
+                const float * vb = vc + kvh*max_seq_len*head_dim;
+                const float * qp = qt + qh*head_dim;
+                float * op = ot + qh*head_dim;
+                std::vector<float> sc(slen);
+
+                for (int64_t s = 0; s < slen; ++s) {
+                    float dot = 0.0f;
+                    const float * ks = kb + s*head_dim;
+#ifdef __AVX2__
+                    __m256 acc = _mm256_setzero_ps();
+                    int64_t dd = 0;
+                    for (; dd+8 <= head_dim; dd += 8)
+                        acc = _mm256_fmadd_ps(_mm256_loadu_ps(qp+dd),
+                                              _mm256_loadu_ps(ks+dd), acc);
+                    alignas(32) float tmp[8];
+                    _mm256_storeu_ps(tmp, acc);
+                    for (int j = 0; j < 8; ++j) dot += tmp[j];
+                    for (; dd < head_dim; ++dd) dot += qp[dd]*ks[dd];
+#else
+                    for (int64_t dd = 0; dd < head_dim; ++dd) dot += qp[dd]*ks[dd];
+#endif
+                    sc[s] = dot * scale_f;
+                }
+                float mx = sc[0];
+                for (int64_t s = 1; s < slen; ++s) mx = std::max(mx, sc[s]);
+                float se = 0.0f;
+                for (int64_t s = 0; s < slen; ++s) { sc[s] = std::exp(sc[s]-mx); se += sc[s]; }
+                float iv = 1.0f / se;
+                for (int64_t s = 0; s < slen; ++s) sc[s] *= iv;
+                std::memset(op, 0, head_dim*sizeof(float));
+                for (int64_t s = 0; s < slen; ++s) {
+                    const float p = sc[s];
+                    const float * vs = vb + s*head_dim;
+#ifdef __AVX2__
+                    const __m256 pv = _mm256_set1_ps(p);
+                    int64_t dd = 0;
+                    for (; dd+8 <= head_dim; dd += 8) {
+                        __m256 o = _mm256_loadu_ps(op+dd);
+                        o = _mm256_fmadd_ps(pv, _mm256_loadu_ps(vs+dd), o);
+                        _mm256_storeu_ps(op+dd, o);
+                    }
+                    for (; dd < head_dim; ++dd) op[dd] += p*vs[dd];
+#else
+                    for (int64_t dd = 0; dd < head_dim; ++dd) op[dd] += p*vs[dd];
+#endif
+                }
+            }
+        }
+
+        // O projection + residual
+        for (int64_t t = 0; t < N; ++t)
+            lb_one(attn_b.data()+t*hidden_size, o_b.data()+t*hidden_size, 3, lay);
+        for (int64_t t = 0; t < N; ++t) {
+#ifdef __AVX2__
+            for (int64_t i = 0; i+8 <= hidden_size; i += 8)
+                _mm256_storeu_ps(x+t*hidden_size+i,
+                    _mm256_add_ps(_mm256_loadu_ps(res+t*hidden_size+i),
+                                 _mm256_loadu_ps(o_b.data()+t*hidden_size+i)));
+            for (int64_t i = (hidden_size/8)*8; i < hidden_size; ++i)
+                x[t*hidden_size+i] = res[t*hidden_size+i] + o_b[t*hidden_size+i];
+#else
+            for (int64_t i = 0; i < hidden_size; ++i)
+                x[t*hidden_size+i] = res[t*hidden_size+i] + o_b[t*hidden_size+i];
+#endif
+        }
+
+        // === MLP block ===
+        std::swap(x, res);
+        for (int64_t t = 0; t < N; ++t)
+            rms_norm_inline(res+t*hidden_size, ln2_w, eps_f,
+                           hidden_size, normed_b.data()+t*hidden_size);
+
+        const int64_t g_dim = layer_dims[lay*28 + 4*4 + 3];
+        for (int64_t t = 0; t < N; ++t) {
+            lb_one(normed_b.data()+t*hidden_size, gate_b.data()+t*g_dim, 4, lay);
+            lb_one(normed_b.data()+t*hidden_size, up_b.data()+t*g_dim, 5, lay);
+        }
+        for (int64_t t = 0; t < N; ++t)
+            silu_mul_inline(gate_b.data()+t*g_dim, up_b.data()+t*g_dim,
+                           g_dim, mlp_b.data()+t*g_dim);
+
+        for (int64_t t = 0; t < N; ++t)
+            lb_one(mlp_b.data()+t*g_dim, down_b.data()+t*hidden_size, 6, lay);
+        for (int64_t t = 0; t < N; ++t) {
+#ifdef __AVX2__
+            for (int64_t i = 0; i+8 <= hidden_size; i += 8)
+                _mm256_storeu_ps(x+t*hidden_size+i,
+                    _mm256_add_ps(_mm256_loadu_ps(res+t*hidden_size+i),
+                                 _mm256_loadu_ps(down_b.data()+t*hidden_size+i)));
+            for (int64_t i = (hidden_size/8)*8; i < hidden_size; ++i)
+                x[t*hidden_size+i] = res[t*hidden_size+i] + down_b[t*hidden_size+i];
+#else
+            for (int64_t i = 0; i < hidden_size; ++i)
+                x[t*hidden_size+i] = res[t*hidden_size+i] + down_b[t*hidden_size+i];
+#endif
+        }
+    }
+
+    // Final RMSNorm
+    auto output = at::empty({N, hidden_size}, embed_weight.options());
+    float * out_ptr = output.data_ptr<float>();
+    for (int64_t t = 0; t < N; ++t)
+        rms_norm_inline(x+t*hidden_size, final_norm_ptr, eps_f,
+                       hidden_size, out_ptr+t*hidden_size);
+    return output;
+}
+
+// ============================================================================
 // Q4_0 quantized lm_head (llama.cpp compatible format)
 // ============================================================================
 
@@ -2116,6 +2355,15 @@ TORCH_LIBRARY(littlebit_cpu_ops, m) {
         "int max_seq_len, int position, float attn_scale, float rms_eps"
         ") -> Tensor"
     );
+    m.def(
+        "full_forward_batch("
+        "Tensor token_ids, Tensor embed_weight, Tensor final_norm_weight, "
+        "Tensor[] layer_tensors, Tensor[] kv_caches, "
+        "int[] layer_dims, int num_layers, int hidden_size, "
+        "int num_kv_heads, int kv_repeat, int head_dim, "
+        "int max_seq_len, int start_position, float attn_scale, float rms_eps"
+        ") -> Tensor"
+    );
     m.def("quantize_lm_head_q4(Tensor weight) -> Tensor");
     m.def(
         "generate_token("
@@ -2141,6 +2389,7 @@ TORCH_LIBRARY_IMPL(littlebit_cpu_ops, CPU, m) {
     m.impl("repack_signs_to_i2", littlebit_cpu_ops::repack_signs_to_i2_cpu);
     m.impl("littlebit_linear_i2", littlebit_cpu_ops::littlebit_linear_i2_cpu);
     m.impl("full_forward", littlebit_cpu_ops::full_forward_cpu);
+    m.impl("full_forward_batch", littlebit_cpu_ops::full_forward_batch_cpu);
     m.impl("quantize_lm_head_q4", littlebit_cpu_ops::quantize_lm_head_q4_cpu);
     m.impl("generate_token", littlebit_cpu_ops::generate_token_cpu);
 }

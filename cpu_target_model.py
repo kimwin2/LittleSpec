@@ -321,6 +321,48 @@ class _LBModelUnit:
         self._cache_pos += 1
         return final_hidden
 
+    @torch.no_grad()
+    def forward_batch(
+        self, token_ids: List[int], embed_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Process N tokens through the transformer in one C++ call.
+
+        Uses full_forward_batch C++ op for batch prefill with causal attention.
+        Returns hidden states (N, hidden_size) after final RMSNorm.
+        """
+        self._ensure_cache()
+        n = len(token_ids)
+        if n == 0:
+            return torch.empty(0, self.config.hidden_size)
+
+        if self._use_full_forward and _has_cpp_op("full_forward_batch"):
+            tok_tensor = torch.tensor(token_ids, dtype=torch.long)
+            hidden = torch.ops.littlebit_cpu_ops.full_forward_batch(
+                tok_tensor,
+                embed_tokens,
+                self.lb_model.final_norm_weight.contiguous(),
+                self._layer_tensors,
+                self._kv_cache_tensors,
+                self._layer_dims,
+                self.config.num_hidden_layers,
+                self.config.hidden_size,
+                self.config.num_key_value_heads,
+                self.lb_model.kv_repeat,
+                self.lb_model.head_dim,
+                self.max_seq_len,
+                self._cache_pos,
+                self.lb_model.attn_scale,
+                self.config.rms_norm_eps,
+            )
+            self._cache_pos += n
+            return hidden  # (N, hidden_size)
+
+        # Fallback: serial per-token
+        results = []
+        for tid in token_ids:
+            results.append(self.forward_token(tid, embed_tokens))
+        return torch.cat(results, dim=0)  # (N, hidden_size)
+
 
 # ============================================================================
 # CPUTargetModel — the public class
@@ -398,14 +440,17 @@ class CPUTargetModel:
 
         # Log C++ op availability
         cpp_ops = [
-            "full_forward", "repack_signs_to_i2",
+            "full_forward", "full_forward_batch", "repack_signs_to_i2",
             "embedding_lookup", "rms_norm", "dense_gemv_f32",
         ]
         avail = [name for name in cpp_ops if _has_cpp_op(name)]
+        self._use_batch_forward = _has_cpp_op("full_forward_batch")
         logger.info(
             f"C++ ops available: "
             f"{avail if avail else 'none (Python fallback)'}"
         )
+        if self._use_batch_forward:
+            logger.info("Batch forward enabled — verification in 1 call")
         logger.info("CPU target model ready (draft + residual)")
 
     # ------------------------------------------------------------------
@@ -428,6 +473,10 @@ class CPUTargetModel:
 
         Uses persistent KV cache: only processes tokens beyond the common
         prefix shared with the previous call's input.
+
+        When full_forward_batch is available, processes all new tokens in
+        ONE C++ call per model unit + ONE batch lm_head GEMM, eliminating
+        per-token Python overhead.
 
         Args:
             input_ids:  (1, seq_len) token IDs
@@ -454,39 +503,51 @@ class CPUTargetModel:
         self.draft_unit._cache_pos = common
         self.residual_unit._cache_pos = common
 
-        # --- Process tokens from <common> onward -----------------------------
-        new_logits: List[torch.Tensor] = []
+        n_new = seq_len - common
 
-        for pos in range(common, seq_len):
-            token_id = input_ids[0, pos].item()
+        if n_new <= 0:
+            self._cached_tokens = input_ids[0].tolist()
+            return torch.zeros(1, seq_len, self._vocab_size)
 
-            hidden_d = self.draft_unit.forward_token(
-                token_id, self.embed_tokens
+        # === BATCH PATH: one C++ call per model unit =========================
+        if self._use_batch_forward and n_new > 0:
+            new_token_ids = input_ids[0, common:seq_len].tolist()
+
+            # One C++ call each → [N, hidden_size]
+            hidden_d = self.draft_unit.forward_batch(
+                new_token_ids, self.embed_tokens
             )
-            hidden_r = self.residual_unit.forward_token(
-                token_id, self.embed_tokens
+            hidden_r = self.residual_unit.forward_batch(
+                new_token_ids, self.embed_tokens
             )
 
-            # Sum hidden states, then one lm_head — mathematically equivalent
-            # to lm_head(h_d) + lm_head(h_r) since lm_head is linear.
-            combined_hidden = hidden_d + hidden_r
-            combined_logits = _cpp_lm_head(combined_hidden, self.lm_head_weight)
-            new_logits.append(combined_logits.squeeze(0))  # (vocab_size,)
+            # Sum hidden states → batch lm_head GEMM
+            combined = (hidden_d + hidden_r).to(torch.float32)
+            # [N, hidden] × [vocab, hidden]^T → [N, vocab]  (GEMM!)
+            new_logits_tensor = F.linear(combined, self.lm_head_weight)
+        else:
+            # === SERIAL FALLBACK =============================================
+            new_logits = []
+            for pos in range(common, seq_len):
+                token_id = input_ids[0, pos].item()
+                hidden_d = self.draft_unit.forward_token(
+                    token_id, self.embed_tokens
+                )
+                hidden_r = self.residual_unit.forward_token(
+                    token_id, self.embed_tokens
+                )
+                combined_hidden = hidden_d + hidden_r
+                combined_logits = _cpp_lm_head(
+                    combined_hidden, self.lm_head_weight
+                )
+                new_logits.append(combined_logits.squeeze(0))
+            new_logits_tensor = torch.stack(new_logits, dim=0)
 
         # --- Save tokens for next call's prefix comparison -------------------
         self._cached_tokens = input_ids[0].tolist()
 
         # --- Build full (1, seq_len, vocab) tensor ---------------------------
-        if not new_logits:
-            # Edge case: all tokens were already cached
-            return torch.zeros(1, seq_len, self._vocab_size)
-
-        new_logits_tensor = torch.stack(new_logits, dim=0)  # (N_new, V)
-
         if common > 0:
-            # Pad cached positions with zeros — speculative_decode never
-            # accesses logits at positions < current_prefix_len - 1,
-            # so the zeros are harmless.
             pad = torch.zeros(common, self._vocab_size)
             full_logits = torch.cat([pad, new_logits_tensor], dim=0)
         else:
