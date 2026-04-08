@@ -160,7 +160,8 @@ def main(args):
         raise RuntimeError("Model could not be loaded based on the provided arguments.")
 
     # --- Tokenizer Setup ---
-    tokenizer = load_tokenizer(args.model_id)
+    tokenizer_id = args.base_model_id if args.base_model_id else args.model_id
+    tokenizer = load_tokenizer(tokenizer_id)
 
     # --- Accelerator / Device Setup ---
     if args.use_accelerator:
@@ -201,6 +202,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_accelerator", type=str2bool, default=False)
 
     parser.add_argument("--model_id", type=str, default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--base_model_id", type=str, default=None,
+                        help="Base model ID for tokenizer (use when model_id is a quantized checkpoint)")
     parser.add_argument("--fp_eval", type=str2bool, default=False)
 
     # Note: Default values are set to None.
