@@ -19,11 +19,11 @@ set -e
 
 BASE_MODEL_ID="/group-volume/ym1012.kim/homepc/LittleSpec/Llama-3.1-8B-Instruct"
 
-# Draft model (0.3-bit)
-DRAFT_MODEL_PATH="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.3bit/2026_03_31_19_01"
+# Draft model (0.1-bit, trained with mixed dataset)
+DRAFT_MODEL_PATH="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step1_draft_0.1bit_mixed/2026_04_05_02_58"
 
-# Residual model (1.7-bit)
-RESIDUAL_MODEL_PATH="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step2_residual_1.7bit/2026_03_31_19_01"
+# Residual model (1.9-bit, trained with mixed dataset)
+RESIDUAL_MODEL_PATH="/group-volume/ym1012.kim/homepc/LittleSpec/outputs/step2_residual_1.9bit_mixed/2026_04_06_14_04"
 
 # Evaluation settings
 PPL_TASK="wikitext2"
